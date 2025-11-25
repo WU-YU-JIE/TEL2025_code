@@ -1,16 +1,39 @@
 TEL2025_MainCode
 └─ ALL_TEXTS.txt
-└─ XboxGUI_V1.ui
-└─ XboxGUI_V2.ui
-└─ aim.py
 └─ files_content.jsonl
 └─ files_report.csv
 └─ files_tree.txt
-└─ main.py
-└─ mega1_controller.py
+└─ onnxTran.py
+└─ pc_remote_client_gui.py
+└─ pc_remote_qt.py
+└─ remote_layout.ui
 └─ scan_folder.py
-└─ xboxGUI.py
+└─ yolo11n.pt
+└─ yolotest.py
 └─ aim
     └─ aim.ino
 └─ chassis_shooter
     └─ chassis_shooter.ino
+└─ presets
+    └─ preset_1.json
+    └─ preset_2.json
+    └─ preset_3.json
+    └─ preset_4.json
+    └─ preset_5.json
+    └─ preset_6.json
+    └─ preset_7.json
+    └─ preset_8.json
+    └─ preset_9.json
+└─ runs
+    └─ detect
+        └─ tel_nano
+            └─ args.yaml
+            └─ weights
+└─ 沒用的檔案
+    └─ XboxGUI_V1.ui
+    └─ XboxGUI_V2.ui
+    └─ aim.py
+    └─ main.py
+    └─ mega1_controller.py
+    └─ system_status_gui.py
+    └─ xboxGUI.py

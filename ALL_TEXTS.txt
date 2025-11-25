@@ -1,107 +1,5 @@
 
 ================================================================================
-FILE: aim.py
-================================================================================
-# aim.py
-# 右搖桿採「微調」（相對位移），非絕對角度：
-#   每幀 Δ角度 = stick * SENS_DEG_PER_S * Δt；夾限到 [min,max]
-#   送出 "1,<xdeg>" / "2,<ydeg>"
-from __future__ import annotations
-from typing import Optional, TYPE_CHECKING, Tuple
-import time
-
-try:
-    import serial as pyserial
-except Exception:
-    pyserial = None  # type: ignore[assignment]
-
-if TYPE_CHECKING:
-    from serial import Serial as SerialT
-else:
-    class SerialT: pass
-
-def _clamp(x, a, b): return a if x < a else b if x > b else x
-
-
-class Aimer:
-    def __init__(self, port="COM18", baud=115200, send_interval_ms=80, verbose=True,
-                 x_min_deg=-30.0, x_max_deg=+30.0, y_min_deg=+10.0, y_max_deg=+80.0,
-                 x_sens_deg_s=60.0, y_sens_deg_s=60.0):
-        self.port, self.baud, self.verbose = port, baud, verbose
-        self._ser: Optional[SerialT] = None
-        self._interval = send_interval_ms / 1000.0
-        self._last_send = 0.0
-        self._x_rng = (float(x_min_deg), float(x_max_deg))
-        self._y_rng = (float(y_min_deg), float(y_max_deg))
-        self._x = (x_min_deg + x_max_deg) / 2.0
-        self._y = (y_min_deg + y_max_deg) / 2.0
-        self._last_xy: Tuple[float, float] = (9999, 9999)
-        self._sx = float(x_sens_deg_s)
-        self._sy = float(y_sens_deg_s)
-        self._connect()
-
-    # ---- serial ----
-    def _connect(self):
-        if pyserial is None:
-            if self.verbose: print("[AIM] pyserial 未安裝，dryrun")
-            return
-        try:
-            self._ser = pyserial.Serial(self.port, self.baud, timeout=0.02)
-            if self.verbose: print(f"[AIM] OPEN {self.port} @ {self.baud}")
-            time.sleep(1.5)
-        except Exception as e:
-            self._ser = None
-            if self.verbose: print(f"[AIM] 開啟失敗：{e}（dryrun）")
-
-    def _send_line(self, s: str):
-        if not s.endswith("\n"): s += "\n"
-        if self._ser:
-            try: self._ser.write(s.encode("utf-8"))
-            except Exception as e:
-                if self.verbose: print(f"[AIM] 寫入失敗：{e}")
-        else:
-            if self.verbose: print(f"[AIM] (drysend) {s.strip()}")
-
-    # ---- 相對微調 ----
-    def nudge_from_stick(self, rx: float, ry: float, dt: float):
-        """rx, ry ∈ [-1,1]；dt 秒；上推為正 → y 取反號"""
-        if dt <= 0: return
-        dx = float(rx) * self._sx * dt
-        dy = float(-ry) * self._sy * dt
-        self._x = _clamp(self._x + dx, *self._x_rng)
-        self._y = _clamp(self._y + dy, *self._y_rng)
-        self._maybe_send()
-
-    def _maybe_send(self):
-        now = time.time()
-        if now - self._last_send < self._interval:
-            return
-        cur = (round(self._x, 3), round(self._y, 3))
-        if cur == self._last_xy:
-            return
-        self._last_send = now
-        self._last_xy = cur
-        self._send_line(f"1,{cur[0]:.3f}")
-        self._send_line(f"2,{cur[1]:.3f}")
-
-    # 可選：置中 / 直接設角度
-    def home_center(self):
-        self._x = sum(self._x_rng) * 0.5
-        self._y = sum(self._y_rng) * 0.5
-        self._maybe_send()
-
-    def set_xy_deg(self, x_deg: float, y_deg: float):
-        self._x = _clamp(float(x_deg), *self._x_rng)
-        self._y = _clamp(float(y_deg), *self._y_rng)
-        self._maybe_send()
-
-    def close(self):
-        if self._ser:
-            try: self._ser.close()
-            finally: self._ser = None
-            if self.verbose: print("[AIM] CLOSED")
-    
-================================================================================
 FILE: ALL_TEXTS.txt
 ================================================================================
 [[EMPTY OR UNREADABLE TEXT]]
@@ -136,212 +34,1402 @@ TEL2025_MainCode
 └─ chassis_shooter
     └─ chassis_shooter.ino
 ================================================================================
-FILE: main.py
+FILE: onnxTran.py
 ================================================================================
-# main.py
-# 將 xboxGUI 的 6 軸/6 鍵事件 → MegaController / Aimer
-# 規格：
-#   進料=R、退料=F、低速=-50、高速=-100
-#   前後=左搖桿 Y（vx）、左右=左搖桿 X（vy）
-#   旋轉=AXIS5(右) - AXIS4(左) → [-100..100]
-#   BTN4(LB)=Aim_X lock、BTN5(RB)=Aim_Y lock（按住鎖定該軸為 0）
+from ultralytics import YOLO
 
-import time
-import xboxGUI
-from mega1_controller import MegaController
-from aim import Aimer
+# 1. 設定模型路徑 (使用 raw string r"..." 避免路徑錯誤)
+model_path = r"C:\Users\user\OneDrive - 中原大學\桌面\大學作品集\東京威力\TEL.v2i\runs\detect\train16\weights\best.pt"
 
-# ===== 連線參數 =====
-MEGA_PORT = "COM19"
-AIM_PORT  = "COM18"
-BAUD      = 115200
+print(f"正在載入模型：{model_path}")
 
-# 比例（可依需要調整）
-SCALE_FWD  = 100.0  # 前後百分比 = ly * SCALE_FWD
-SCALE_MOVE = 100.0  # 左右百分比 = lx * SCALE_MOVE
-SCALE_ROT  = 100.0  # 自旋百分比 = (rot_r_pos - rot_l_pos) * SCALE_ROT
-
-def _to_pos(v):  # 觸發鍵 [-1..+1] → [0..1]
-    return (float(v) + 1.0) * 0.5
-
-mega  = MegaController(port=MEGA_PORT, baud=BAUD, send_interval_s=0.08, verbose=True)
-aimer = Aimer(port=AIM_PORT,  baud=BAUD, send_interval_ms=80,  verbose=True)
-
-aim_x_locked = False
-aim_y_locked = False
-_last_t = time.monotonic()
-
-def on_axis(lx, ly, rx, ry, rot_l, rot_r):
-    global _last_t
-    now = time.monotonic()
-    dt  = max(0.0, now - _last_t)
-    _last_t = now
-
-    # 前後 & 左右
-    mega.move_forward(int(-ly * SCALE_FWD))
-    mega.move_XY(int(lx * SCALE_MOVE))
-
-    # 旋轉（AXIS5 - AXIS4）
-    rot_percent = int((_to_pos(rot_r) - _to_pos(rot_l)) * SCALE_ROT)
-    mega.rotate(rot_percent)
-
-    # Aim：鎖定時把對應軸視為 0（不微調）
-    rx_eff = 0.0 if aim_x_locked else rx
-    ry_eff = 0.0 if aim_y_locked else ry
-    aimer.nudge_from_stick(rx_eff, ry_eff, dt)
-
-def on_buttons(a, b, x, y, lb, rb):
-    global aim_x_locked, aim_y_locked
-    # 射手（R/F/-50/-100）
-    if b: mega.feed()        # R
-    if x: mega.reverse()     # F
-    if a: mega.set_neo(-50)
-    if y: mega.set_neo(-100)
-
-    # 鎖定：按住即鎖（鬆開即解除）
-    aim_x_locked = bool(lb)  # BTN4
-    aim_y_locked = bool(rb)  # BTN5
-
-def main():
-    try:
-        xboxGUI.run({"on_axis": on_axis, "on_buttons": on_buttons})
-    finally:
-        try: mega.close()
-        except: pass
-        try: aimer.close()
-        except: pass
-
-if __name__ == "__main__":
-    main()
-
-================================================================================
-FILE: mega1_controller.py
-================================================================================
-# mega1_controller.py
-# CHASSIS: 週期送 "vx,vy,wz\n"（vx/前後、vy/左右、wz/自旋）
-# SHOOTER: "R"/"F"/整數 -100..100
-from __future__ import annotations
-import threading, time
-from typing import Optional, TYPE_CHECKING
-
+# 2. 載入 PyTorch 模型
 try:
-    import serial as pyserial
-except Exception:
-    pyserial = None  # type: ignore[assignment]
+    model = YOLO(model_path)
+except Exception as e:
+    print(f"找不到模型，請確認路徑。\n錯誤訊息: {e}")
+    exit()
 
-if TYPE_CHECKING:
-    from serial import Serial as SerialT
-else:
-    class SerialT: pass
+print("模型載入成功，開始轉換為 ONNX 格式...")
+
+# 3. 執行轉檔 (export)
+# format='onnx': 指定轉出格式
+# opset=12: 這是 ONNX 的版本，12 對樹莓派相容性較好，若報錯可改用預設值
+# simplify=True: 簡化模型結構，讓推論更快 (需要安裝 onnx-simplifier，若失敗可改 False)
+try:
+    path = model.export(format='onnx', opset=12)
+    print(f"\n轉檔成功！檔案已儲存於: {path}")
+except Exception as e:
+    print(f"\n轉檔失敗: {e}")
+    print("請嘗試安裝必要套件: pip install onnx onnxruntime")
+================================================================================
+FILE: pc_remote_client_gui.py
+================================================================================
+# pc_remote_client_gui.py
+# 筆電端遙控程式：
+# - 透過 TCP 連到 Raspberry Pi 上的 pi_remote_server.py
+# - 底盤：W / A / S / D + 左右方向鍵 控制 CHASSIS vx vy wz
+# - Shooter：F / R / X 控 STEP F/R/S，1 / 2 / 3 控 SERVO S1/S2/S3，NEO 速度輸入
+# - AIM：
+#     L / J 控 M1 (軸1) ±1°
+#     I / K 控 M2 (軸2) ±1°
+#   並提供：
+#     M1 設為原點 / M1 回原點
+#     M2 設為原點 / M2 回原點
+#   預設角度：
+#     9 個檔案槽 → presets/preset_1.json ~ preset_9.json
+#     10 個參數按鈕 → 每檔第 1~10 筆 [M1,M2]
+#     按 P 鍵：直接載入 + 立即送出（若已連線）
+
+import socket
+import threading
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+import os
+import json
+
+DEFAULT_HOST = "10.254.97.208"
+DEFAULT_PORT = 5000
+PRESET_DIR   = "presets"   # JSON 放這裡（與此程式同層的 presets 資料夾）
 
 
-class MegaController:
-    MODE_CHASSIS = "CHASSIS"
-    MODE_SHOOTER = "SHOOTER"
+class RemoteClient:
+    def __init__(self):
+        self.sock = None
+        self.lock = threading.Lock()
+        self.running = False
+        self.on_recv = None  # callback(str)
 
-    def __init__(self, port="COM19", baud=115200, send_interval_s=0.08, verbose=True):
-        self.port, self.baud, self.verbose = port, baud, verbose
-        self._ser: Optional[SerialT] = None
-        self._vx = 0.0; self._vy = 0.0; self._wz = 0.0
-        self._interval = max(0.01, float(send_interval_s))
-        self._mode = self.MODE_CHASSIS
-        self._stop = threading.Event()
-        self._lock = threading.Lock()
-        self._connect()
-        self._start_tx_loop()
+    def connect(self, host, port):
+        self.close()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5.0)
+        s.connect((host, port))
+        s.settimeout(None)
+        self.sock = s
+        self.running = True
+        t = threading.Thread(target=self._recv_loop, daemon=True)
+        t.start()
 
-    # ---- serial ----
-    def _connect(self):
-        if pyserial is None:
-            if self.verbose: print("[Mega] pyserial 未安裝，dryrun")
-            return
+    def _recv_loop(self):
         try:
-            self._ser = pyserial.Serial(self.port, self.baud, timeout=0.0, write_timeout=0.0)
-            if self.verbose: print(f"[Mega] OPEN {self.port} @ {self.baud}")
-            time.sleep(1.5)
-            self._send_line(f"MODE {self._mode}")
+            f = self.sock.makefile("r")
+            for line in f:
+                line = line.rstrip("\r\n")
+                if self.on_recv:
+                    self.on_recv(line)
+            if self.on_recv:
+                self.on_recv("[INFO] Server closed connection")
         except Exception as e:
-            self._ser = None
-            if self.verbose: print(f"[Mega] 開啟失敗：{e}（dryrun）")
+            if self.on_recv:
+                self.on_recv(f"[ERR] recv: {e}")
+        finally:
+            self.close()
 
-    def _close(self):
-        if self._ser:
-            try: self._ser.close()
-            finally: self._ser = None
-            if self.verbose: print("[Mega] CLOSED")
-
-    def _send_line(self, s: str):
-        if not s.endswith("\n"): s += "\n"
-        if self._ser:
-            try: self._ser.write(s.encode("ascii"))
-            except Exception as e:
-                if self.verbose: print(f"[Mega] 寫入失敗：{e}")
-        else:
-            if self.verbose: print(f"[Mega] (drysend) {s.strip()}")
-
-    # ---- 背景廣播（僅 CHASSIS）----
-    def _start_tx_loop(self):
-        def loop():
-            next_t = 0.0
-            while not self._stop.is_set():
-                now = time.monotonic()
-                if now >= next_t:
-                    with self._lock:
-                        mode, vx, vy, wz = self._mode, self._vx, self._vy, self._wz
-                    if mode == self.MODE_CHASSIS:
-                        self._send_line(f"{vx:.2f},{vy:.2f},{wz:.2f}")
-                    next_t = now + self._interval
-                time.sleep(0.002)
-        threading.Thread(target=loop, daemon=True).start()
-
-    # ---- 公開 API ----
-    def move_forward(self, percent: int):
-        """前後（-100..100 → vx -1..1）"""
-        p = max(-100, min(100, int(percent)))
-        with self._lock:
-            self._vx = p / 100.0
-        if abs(p) > 0: self.set_mode(self.MODE_CHASSIS)
-
-    def move_XY(self, percent: int):
-        """左右（-100..100 → vy -1..1）"""
-        p = max(-100, min(100, int(percent)))
-        with self._lock:
-            self._vy = p / 100.0
-        if abs(p) > 0: self.set_mode(self.MODE_CHASSIS)
-    move_xy = move_XY  # 別名
-
-    def rotate(self, percent: int):
-        """自旋（-100..100 → wz -1..1）"""
-        p = max(-100, min(100, int(percent)))
-        with self._lock:
-            self._wz = p / 100.0
-        if abs(p) > 0: self.set_mode(self.MODE_CHASSIS)
-
-    # 射手端
-    def feed(self):       # 'R'
-        self.set_mode(self.MODE_SHOOTER)
-        self._send_line("R")
-
-    def reverse(self):    # 'F'
-        self.set_mode(self.MODE_SHOOTER)
-        self._send_line("F")
-
-    def set_neo(self, speed: int):  # -100..100
-        v = int(max(-100, min(100, speed)))
-        self.set_mode(self.MODE_SHOOTER)
-        self._send_line(str(v))
-
-    def set_mode(self, mode: str):
-        if mode not in (self.MODE_CHASSIS, self.MODE_SHOOTER): return
-        with self._lock:
-            if mode == self._mode: return
-            self._mode = mode
-        self._send_line(f"MODE {mode}")
-        time.sleep(0.2)  # 切模式保險緩衝
+    def send_line(self, text):
+        with self.lock:
+            if not self.sock:
+                raise RuntimeError("not connected")
+            data = (text.strip() + "\n").encode("utf-8")
+            self.sock.sendall(data)
 
     def close(self):
-        self._stop.set(); time.sleep(0.05); self._close()
+        with self.lock:
+            if self.sock:
+                try:
+                    self.sock.close()
+                except:
+                    pass
+            self.sock = None
+            self.running = False
 
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Laptop Remote Controller -> Pi")
+        self.geometry("820x760")
+        self.resizable(False, False)
+
+        self.client = RemoteClient()
+        self.client.on_recv = self._on_recv
+
+        # 狀態
+        self.connected = False
+        self.host_var = tk.StringVar(value=DEFAULT_HOST)
+        self.port_var = tk.IntVar(value=DEFAULT_PORT)
+        self.speed_scale = tk.DoubleVar(value=0.6)  # 底盤速度倍率 (0~1)
+
+        # 底盤鍵盤狀態
+        self.keys = {
+            "w": False,
+            "a": False,
+            "s": False,
+            "d": False,
+            "left": False,
+            "right": False
+        }
+        self.vx = 0.0
+        self.vy = 0.0
+        self.wz = 0.0
+
+        # Shooter
+        self.neo_var = tk.StringVar(value="0")
+        self.raw_var = tk.StringVar(value="STATUS")
+
+        # AIM 狀態（手動）
+        self.AIM_STEP = 1.0
+        self.m1_angle = 0.0
+        self.m2_angle = 0.0
+
+        # AIM 預設選擇
+        self.current_file_slot   = None  # 1..9
+        self.current_param_slot  = None  # 1..10
+
+        self._ensure_preset_dir()
+        self._build_ui()
+        self._bind_keys()
+
+    # ===== 共用 UI =====
+    def _build_ui(self):
+        frm = ttk.Frame(self, padding=8)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        row = 0
+        # 連線區
+        ttk.Label(frm, text="Pi IP：").grid(column=0, row=row, sticky=tk.W)
+        ttk.Entry(frm, textvariable=self.host_var, width=20).grid(column=1, row=row, sticky=tk.W)
+
+        ttk.Label(frm, text="Port：").grid(column=2, row=row, sticky=tk.W)
+        ttk.Entry(frm, textvariable=self.port_var, width=8).grid(column=3, row=row, sticky=tk.W)
+
+        self.btn_connect = ttk.Button(frm, text="連線", command=self._toggle_connect)
+        self.btn_connect.grid(column=4, row=row, padx=8, sticky=tk.W)
+
+        self.status_var = tk.StringVar(value="未連線")
+        ttk.Label(frm, textvariable=self.status_var).grid(column=5, row=row, sticky=tk.W)
+
+        row += 1
+        # 底盤控制說明
+        ttk.Label(
+            frm,
+            text="底盤：W/S 前後  A/D 左右  ←/→ 旋轉    速度倍率："
+        ).grid(column=0, row=row, columnspan=4, sticky=tk.W, pady=(8, 0))
+
+        ttk.Scale(
+            frm, from_=0.0, to=1.0, orient=tk.HORIZONTAL,
+            variable=self.speed_scale, length=200,
+            command=lambda v: self._update_speed_label()
+        ).grid(column=4, row=row, columnspan=2, sticky=tk.W, pady=(8, 0))
+
+        self.sp_lbl = ttk.Label(frm, text=f"{self.speed_scale.get():.2f}")
+        self.sp_lbl.grid(column=6, row=row, sticky=tk.W, pady=(8, 0))
+
+        row += 1
+        # 目前 vx, vy, wz
+        cur = ttk.LabelFrame(frm, text="目前底盤指令")
+        cur.grid(column=0, row=row, columnspan=7, sticky=tk.EW, pady=(8, 4))
+        self.vx_lbl = ttk.Label(cur, text="vx = 0.00")
+        self.vy_lbl = ttk.Label(cur, text="vy = 0.00")
+        self.wz_lbl = ttk.Label(cur, text="wz = 0.00")
+        self.vx_lbl.grid(column=0, row=0, padx=8, pady=4, sticky=tk.W)
+        self.vy_lbl.grid(column=1, row=0, padx=8, pady=4, sticky=tk.W)
+        self.wz_lbl.grid(column=2, row=0, padx=8, pady=4, sticky=tk.W)
+
+        row += 1
+        # Shooter（步進 + Servo + NEO）
+        stp = ttk.LabelFrame(frm, text="Shooter 控制")
+        stp.grid(column=0, row=row, columnspan=7, sticky=tk.EW, pady=(4, 4))
+
+        ttk.Label(stp, text="步進 (STEP)：F / R / X=停").grid(column=0, row=0, padx=8, pady=4, sticky=tk.W)
+        ttk.Button(stp, text="F", command=lambda: self._send_step("F")).grid(column=1, row=0, padx=4, pady=4)
+        ttk.Button(stp, text="R", command=lambda: self._send_step("R")).grid(column=2, row=0, padx=4, pady=4)
+        ttk.Button(stp, text="S", command=lambda: self._send_step("S")).grid(column=3, row=0, padx=4, pady=4)
+
+        ttk.Label(stp, text="Servo：1 / 2 / 3 -> S1/S2/S3").grid(column=0, row=1, padx=8, pady=4, sticky=tk.W)
+        ttk.Button(stp, text="S1", command=lambda: self._send_servo("S1")).grid(column=1, row=1, padx=4, pady=4)
+        ttk.Button(stp, text="S2", command=lambda: self._send_servo("S2")).grid(column=2, row=1, padx=4, pady=4)
+        ttk.Button(stp, text="S3", command=lambda: self._send_servo("S3")).grid(column=3, row=1, padx=4, pady=4)
+
+        ttk.Label(stp, text="NEO 速度 (-100..100)：").grid(column=0, row=2, padx=8, pady=4, sticky=tk.W)
+        ttk.Entry(stp, textvariable=self.neo_var, width=8).grid(column=1, row=2, padx=4, pady=4, sticky=tk.W)
+        ttk.Button(stp, text="送出 NEO", command=self._send_neo).grid(column=2, row=2, padx=4, pady=4, sticky=tk.W)
+
+        row += 1
+        # AIM 手動控制
+        aimf = ttk.LabelFrame(frm, text="AIM 控制（L/J 控 M1，I/K 控 M2，每步 1°）")
+        aimf.grid(column=0, row=row, columnspan=7, sticky=tk.EW, pady=(4, 4))
+
+        self.m1_lbl = ttk.Label(aimf, text="M1 = 0.0°")
+        self.m2_lbl = ttk.Label(aimf, text="M2 = 0.0°")
+        self.m1_lbl.grid(column=0, row=0, padx=8, pady=4, sticky=tk.W)
+        self.m2_lbl.grid(column=0, row=1, padx=8, pady=4, sticky=tk.W)
+
+        ttk.Button(aimf, text="M1 -", command=lambda: self._aim_delta(1, -self.AIM_STEP)).grid(column=1, row=0, padx=4, pady=4)
+        ttk.Button(aimf, text="M1 +", command=lambda: self._aim_delta(1,  self.AIM_STEP)).grid(column=2, row=0, padx=4, pady=4)
+        ttk.Button(aimf, text="M1 設為原點", command=lambda: self._aim_reset_origin(1)).grid(column=3, row=0, padx=4, pady=4)
+        ttk.Button(aimf, text="M1 回原點", command=lambda: self._aim_go_origin(1)).grid(column=4, row=0, padx=4, pady=4)
+
+        ttk.Button(aimf, text="M2 -", command=lambda: self._aim_delta(2, -self.AIM_STEP)).grid(column=1, row=1, padx=4, pady=4)
+        ttk.Button(aimf, text="M2 +", command=lambda: self._aim_delta(2,  self.AIM_STEP)).grid(column=2, row=1, padx=4, pady=4)
+        ttk.Button(aimf, text="M2 設為原點", command=lambda: self._aim_reset_origin(2)).grid(column=3, row=1, padx=4, pady=4)
+        ttk.Button(aimf, text="M2 回原點", command=lambda: self._aim_go_origin(2)).grid(column=4, row=1, padx=4, pady=4)
+
+        self._update_aim_labels()
+
+        row += 1
+        # AIM 預設角度（9 檔案槽 + 10 參數）
+        pf = ttk.LabelFrame(frm, text="AIM 預設角度（9 檔案槽 + 10 參數；preset_1~preset_9.json，每筆 [M1,M2]）")
+        pf.grid(column=0, row=row, columnspan=7, sticky=tk.NSEW, pady=(4, 4))
+
+        file_frame = ttk.Frame(pf)
+        file_frame.pack(fill="x", pady=(2, 2))
+        self.file_buttons = []
+        for i in range(9):
+            idx = i + 1
+            b = ttk.Button(
+                file_frame, text=f"槽{idx}",
+                command=lambda s=idx: self._select_file_slot(s),
+                width=6
+            )
+            b.grid(row=i // 3, column=i % 3, padx=2, pady=2)
+            self.file_buttons.append(b)
+
+        self.file_info_var  = tk.StringVar(value="未選擇檔案槽（預設檔名 preset_1.json~preset_9.json）")
+        self.param_info_var = tk.StringVar(value="未選擇參數編號")
+        ttk.Label(pf, textvariable=self.file_info_var).pack(anchor="w", padx=4)
+        ttk.Label(pf, textvariable=self.param_info_var).pack(anchor="w", padx=4, pady=(0, 2))
+
+        param_frame = ttk.Frame(pf)
+        param_frame.pack(fill="x", pady=(2, 2))
+        self.param_buttons = []
+        for j in range(10):
+            idx = j + 1
+            b = ttk.Button(
+                param_frame, text=f"P{idx}",
+                command=lambda k=idx: self._param_click(k),
+                width=6
+            )
+            b.grid(row=j // 5, column=j % 5, padx=2, pady=2)
+            self.param_buttons.append(b)
+
+        row += 1
+        # Raw 指令區
+        raw = ttk.LabelFrame(frm, text="Raw 指令（直接傳給 Pi）")
+        raw.grid(column=0, row=row, columnspan=7, sticky=tk.EW, pady=(4, 4))
+        ttk.Entry(raw, textvariable=self.raw_var, width=50).grid(column=0, row=0, padx=4, pady=4)
+        ttk.Button(raw, text="送出 RAW", command=self._send_raw).grid(column=1, row=0, padx=4, pady=4)
+        ttk.Button(raw, text="STATUS", command=self._send_status).grid(column=2, row=0, padx=4, pady=4)
+
+        row += 1
+        # Log
+        lf = ttk.LabelFrame(frm, text="Log (Pi 回覆 & 狀態)")
+        lf.grid(column=0, row=row, columnspan=7, sticky=tk.NSEW, pady=(8, 0))
+        self.log = scrolledtext.ScrolledText(lf, height=10, width=94, state="disabled", wrap="none")
+        self.log.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _bind_keys(self):
+        self.bind("<KeyPress>", self._on_key_press)
+        self.bind("<KeyRelease>", self._on_key_release)
+        self.after(200, lambda: self.focus_force())
+
+    def _ensure_preset_dir(self):
+        if not os.path.isdir(PRESET_DIR):
+            try:
+                os.makedirs(PRESET_DIR, exist_ok=True)
+            except Exception:
+                pass
+
+    # ===== 連線控制 =====
+    def _toggle_connect(self):
+        if self.connected:
+            self._disconnect()
+        else:
+            self._connect()
+
+    def _connect(self):
+        host = self.host_var.get().strip()
+        port = int(self.port_var.get())
+        if not host:
+            messagebox.showwarning("提示", "請輸入 Pi IP")
+            return
+        try:
+            self.client.connect(host, port)
+        except Exception as e:
+            messagebox.showerror("連線失敗", str(e))
+            self.status_var.set("連線失敗")
+            return
+        self.connected = True
+        self.status_var.set(f"已連線：{host}:{port}")
+        self.btn_connect.config(text="斷線")
+        self._append_log("[INFO] connected")
+
+    def _disconnect(self):
+        self.client.close()
+        self.connected = False
+        self.status_var.set("未連線")
+        self.btn_connect.config(text="連線")
+        self._append_log("[INFO] disconnected")
+
+    # ===== Log =====
+    def _append_log(self, txt):
+        self.log.config(state="normal")
+        self.log.insert(tk.END, txt + "\n")
+        self.log.see(tk.END)
+        self.log.config(state="disabled")
+
+    def _on_recv(self, line: str):
+        self.after(0, lambda: self._append_log("[Pi] " + line))
+
+    # ===== 底盤控制 =====
+    def _update_speed_label(self):
+        self.sp_lbl.config(text=f"{self.speed_scale.get():.2f}")
+        self._update_chassis_from_keys()
+
+    def _on_key_press(self, ev):
+        if not self.connected:
+            return
+        k = ev.keysym.lower()
+
+        # 底盤
+        if k in ("w", "a", "s", "d", "left", "right"):
+            if not self.keys.get(k, False):
+                self.keys[k] = True
+                self._update_chassis_from_keys()
+            return
+
+        # Shooter
+        if k == "f":
+            self._send_step("F"); return
+        if k == "r":
+            self._send_step("R"); return
+        if k == "x":
+            self._send_step("S"); return
+
+        # Servo
+        if k == "1":
+            self._send_servo("S1"); return
+        if k == "2":
+            self._send_servo("S2"); return
+        if k == "3":
+            self._send_servo("S3"); return
+
+        # AIM 手動
+        if k == "l":
+            self._aim_delta(1, self.AIM_STEP); return
+        if k == "j":
+            self._aim_delta(1, -self.AIM_STEP); return
+        if k == "i":
+            self._aim_delta(2, self.AIM_STEP); return
+        if k == "k":
+            self._aim_delta(2, -self.AIM_STEP); return
+
+    def _on_key_release(self, ev):
+        if not self.connected:
+            return
+        k = ev.keysym.lower()
+        if k in ("w", "a", "s", "d", "left", "right"):
+            if self.keys.get(k, False):
+                self.keys[k] = False
+                self._update_chassis_from_keys()
+
+    def _update_chassis_from_keys(self):
+        vx = vy = wz = 0.0
+        if self.keys["w"] and not self.keys["s"]:
+            vx = 1.0
+        elif self.keys["s"] and not self.keys["w"]:
+            vx = -1.0
+
+        if self.keys["d"] and not self.keys["a"]:
+            vy = 1.0
+        elif self.keys["a"] and not self.keys["d"]:
+            vy = -1.0
+
+        if self.keys["left"] and not self.keys["right"]:
+            wz = -1.0
+        elif self.keys["right"] and not self.keys["left"]:
+            wz = 1.0
+
+        sp = float(self.speed_scale.get())
+        self.vx = vx * sp
+        self.vy = vy * sp
+        self.wz = wz * sp
+
+        self.vx_lbl.config(text=f"vx = {self.vx:.2f}")
+        self.vy_lbl.config(text=f"vy = {self.vy:.2f}")
+        self.wz_lbl.config(text=f"wz = {self.wz:.2f}")
+
+        if self.connected:
+            try:
+                cmd = f"CHASSIS {self.vx:.2f} {self.vy:.2f} {self.wz:.2f}"
+                self.client.send_line(cmd)
+                self._append_log("[PC] " + cmd)
+            except Exception as e:
+                self._append_log(f"[ERR] send CHASSIS: {e}")
+                self._disconnect()
+
+    # ===== Shooter / RAW =====
+    def _send_step(self, sub):
+        if not self.connected:
+            return
+        cmd = f"STEP {sub}"
+        try:
+            self.client.send_line(cmd)
+            self._append_log("[PC] " + cmd)
+        except Exception as e:
+            self._append_log(f"[ERR] send STEP: {e}")
+            self._disconnect()
+
+    def _send_servo(self, sname):
+        if not self.connected:
+            return
+        cmd = f"SERVO {sname}"
+        try:
+            self.client.send_line(cmd)
+            self._append_log("[PC] " + cmd)
+        except Exception as e:
+            self._append_log(f"[ERR] send SERVO: {e}")
+            self._disconnect()
+
+    def _send_neo(self):
+        if not self.connected:
+            return
+        s = self.neo_var.get().strip()
+        try:
+            v = int(s)
+        except:
+            messagebox.showwarning("警告", "NEO 速度必須為整數 -100..100")
+            return
+        if v < -100: v = -100
+        if v > 100:  v = 100
+        cmd = f"NEO {v}"
+        try:
+            self.client.send_line(cmd)
+            self._append_log("[PC] " + cmd)
+        except Exception as e:
+            self._append_log(f"[ERR] send NEO: {e}")
+            self._disconnect()
+
+    def _send_raw(self):
+        if not self.connected:
+            return
+        txt = self.raw_var.get().strip()
+        if not txt:
+            return
+        cmd = f"RAW {txt}"
+        try:
+            self.client.send_line(cmd)
+            self._append_log("[PC] " + cmd)
+        except Exception as e:
+            self._append_log(f"[ERR] send RAW: {e}")
+            self._disconnect()
+
+    def _send_status(self):
+        if not self.connected:
+            return
+        try:
+            self.client.send_line("STATUS")
+            self._append_log("[PC] STATUS")
+        except Exception as e:
+            self._append_log(f"[ERR] send STATUS: {e}")
+            self._disconnect()
+
+    # ===== AIM 手動 =====
+    def _update_aim_labels(self):
+        self.m1_lbl.config(text=f"M1 = {self.m1_angle:.1f}°")
+        self.m2_lbl.config(text=f"M2 = {self.m2_angle:.1f}°")
+
+    def _aim_send(self, axis, angle):
+        if not self.connected:
+            return
+        cmd = f"AIM {axis} {angle:.3f}"
+        try:
+            self.client.send_line(cmd)
+            self._append_log("[PC] " + cmd)
+        except Exception as e:
+            self._append_log(f"[ERR] send AIM: {e}")
+            self._disconnect()
+
+    def _aim_delta(self, axis, delta):
+        if axis == 1:
+            self.m1_angle += delta
+            angle = self.m1_angle
+        else:
+            self.m2_angle += delta
+            angle = self.m2_angle
+        self._update_aim_labels()
+        self._aim_send(axis, angle)
+
+    def _aim_reset_origin(self, axis):
+        if axis == 1:
+            self.m1_angle = 0.0
+        else:
+            self.m2_angle = 0.0
+        self._update_aim_labels()
+        self._append_log(f"[INFO] AIM M{axis} 設為原點 (UI 角度歸零，不送命令)")
+
+    def _aim_go_origin(self, axis):
+        if axis == 1:
+            self.m1_angle = 0.0
+        else:
+            self.m2_angle = 0.0
+        self._update_aim_labels()
+        self._aim_send(axis, 0.0)
+        self._append_log(f"[INFO] AIM M{axis} 回原點 (送 AIM {axis} 0)")
+
+    # ===== AIM 預設：檔案槽 + 參數 =====
+    def _select_file_slot(self, slot):
+        self.current_file_slot = slot
+        self.current_param_slot = None
+        fname = f"preset_{slot}.json"
+        path = os.path.join(PRESET_DIR, fname)
+        if os.path.exists(path):
+            self.file_info_var.set(f"檔案槽 {slot} → {fname}")
+        else:
+            self.file_info_var.set(f"檔案槽 {slot} → {fname}（檔案不存在）")
+        self.param_info_var.set("未選擇參數編號")
+
+    def _load_preset_value(self, file_slot, param_slot, verbose=True):
+        fname = f"preset_{file_slot}.json"
+        path = os.path.join(PRESET_DIR, fname)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            if verbose:
+                messagebox.showwarning("讀取 JSON 失敗", f"{path}\n{e}")
+            return None
+
+        if not isinstance(data, list):
+            if verbose:
+                messagebox.showwarning("JSON 格式錯誤", f"{path}\n最外層必須為 list。")
+            return None
+
+        idx = param_slot - 1
+        if idx < 0 or idx >= len(data):
+            if verbose:
+                messagebox.showwarning("索引錯誤", f"{path}\n沒有第 {param_slot} 筆資料。")
+            return None
+
+        item = data[idx]
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            m1, m2 = item[0], item[1]
+        elif isinstance(item, dict):
+            m1 = item.get("m1", item.get("M1"))
+            m2 = item.get("m2", item.get("M2"))
+        else:
+            if verbose:
+                messagebox.showwarning("資料格式錯誤", f"{path}\n第 {param_slot} 筆無法解析。")
+            return None
+
+        try:
+            m1 = float(m1)
+            m2 = float(m2)
+        except Exception:
+            if verbose:
+                messagebox.showwarning("資料格式錯誤", f"{path}\n第 {param_slot} 筆不是數值。")
+            return None
+
+        return m1, m2
+
+    def _param_click(self, idx):
+        if self.current_file_slot is None:
+            messagebox.showwarning("尚未選擇檔案槽", "請先按上面的其中一個『槽1~槽9』。")
+            return
+
+        self.current_param_slot = idx
+        res = self._load_preset_value(self.current_file_slot, idx, verbose=True)
+        if res is None:
+            self.param_info_var.set(f"參數編號 P{idx}（讀取失敗）")
+            return
+
+        m1, m2 = res
+        self.m1_angle = m1
+        self.m2_angle = m2
+        self._update_aim_labels()
+        self.param_info_var.set(f"參數編號 P{idx} → M1={m1:.3f}, M2={m2:.3f}")
+
+        if not self.connected:
+            self._append_log(
+                f"[INFO] 槽{self.current_file_slot} P{idx} → 更新 UI，未連線：M1={m1:.3f}, M2={m2:.3f}"
+            )
+            return
+
+        self._aim_send(1, m1)
+        self._aim_send(2, m2)
+        self._append_log(
+            f"[INFO] 槽{self.current_file_slot} P{idx} → 已送出：M1={m1:.3f}, M2={m2:.3f}"
+        )
+
+    # ===== 關閉 =====
+    def _on_close(self):
+        self._disconnect()
+        self.destroy()
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
+
+================================================================================
+FILE: pc_remote_qt.py
+================================================================================
+import sys
+import socket
+import threading
+import json
+import os
+from PyQt6 import uic, QtCore, QtGui
+from PyQt6.QtWidgets import QMainWindow, QApplication, QMessageBox, QPushButton
+from PyQt6.QtCore import pyqtSignal, Qt
+
+DEFAULT_HOST = "10.254.97.208"
+DEFAULT_PORT = 5000
+PRESET_DIR = "presets"
+
+class RemoteClient:
+    """
+    負責 TCP 連線的邏輯類別 (未變動)
+    """
+    def __init__(self):
+        self.sock = None
+        self.lock = threading.Lock()
+        self.running = False
+        self.on_recv = None
+
+    def connect(self, host, port):
+        self.close()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3.0)
+        s.connect((host, port))
+        s.settimeout(None)
+        self.sock = s
+        self.running = True
+        t = threading.Thread(target=self._recv_loop, daemon=True)
+        t.start()
+
+    def _recv_loop(self):
+        try:
+            f = self.sock.makefile("r")
+            for line in f:
+                line = line.rstrip("\r\n")
+                if self.on_recv:
+                    self.on_recv(line)
+            if self.on_recv:
+                self.on_recv("[INFO] Server closed connection")
+        except Exception as e:
+            if self.on_recv and self.running:
+                self.on_recv(f"[ERR] recv: {e}")
+        finally:
+            self.close()
+
+    def send_line(self, text):
+        with self.lock:
+            if not self.sock:
+                raise RuntimeError("not connected")
+            data = (text.strip() + "\n").encode("utf-8")
+            self.sock.sendall(data)
+
+    def close(self):
+        with self.lock:
+            self.running = False
+            if self.sock:
+                try:
+                    self.sock.close()
+                except:
+                    pass
+            self.sock = None
+
+class MainWindow(QMainWindow):
+    log_signal = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        # 載入 .ui 檔案
+        if not os.path.exists("remote_layout.ui"):
+            QMessageBox.critical(self, "錯誤", "找不到 remote_layout.ui")
+            sys.exit(1)
+        uic.loadUi("remote_layout.ui", self)
+        
+        # 初始化變數
+        self.client = RemoteClient()
+        self.client.on_recv = self._on_client_recv
+        self.log_signal.connect(self._append_log)
+
+        self.connected = False
+        self.keys = {k: False for k in ["w", "a", "s", "d", "left", "right"]}
+        self.vx = 0.0
+        self.vy = 0.0
+        self.wz = 0.0
+        
+        self.AIM_STEP = 1.0
+        self.m1_angle = 0.0
+        self.m2_angle = 0.0
+        
+        self.current_file_slot = None
+        self.current_param_slot = None
+
+        self._ensure_preset_dir()
+        self._setup_ui_logic()
+        
+        self.txt_log.setPlaceholderText("等待連線中... 系統就緒")
+
+    def _setup_ui_logic(self):
+        """綁定 UI 事件"""
+        self.btn_connect.clicked.connect(self._toggle_connect)
+        self.slider_speed.valueChanged.connect(self._update_speed_label)
+        
+        self.btn_step_f.clicked.connect(lambda: self._send_step("F"))
+        self.btn_step_r.clicked.connect(lambda: self._send_step("R"))
+        self.btn_step_s.clicked.connect(lambda: self._send_step("S"))
+        
+        self.btn_servo_1.clicked.connect(lambda: self._send_servo("S1"))
+        self.btn_servo_2.clicked.connect(lambda: self._send_servo("S2"))
+        self.btn_servo_3.clicked.connect(lambda: self._send_servo("S3"))
+        
+        # --- 修改處：NEO 改為三個按鈕 ---
+        self.btn_neo_0.clicked.connect(lambda: self._send_neo_val(0))
+        self.btn_neo_n50.clicked.connect(lambda: self._send_neo_val(-50))
+        self.btn_neo_n100.clicked.connect(lambda: self._send_neo_val(-100))
+        # ------------------------------
+        
+        self.btn_m1_dec.clicked.connect(lambda: self._aim_delta(1, -self.AIM_STEP))
+        self.btn_m1_inc.clicked.connect(lambda: self._aim_delta(1, self.AIM_STEP))
+        self.btn_m1_set0.clicked.connect(lambda: self._aim_reset_origin(1))
+        self.btn_m1_go0.clicked.connect(lambda: self._aim_go_origin(1))
+        
+        self.btn_m2_dec.clicked.connect(lambda: self._aim_delta(2, -self.AIM_STEP))
+        self.btn_m2_inc.clicked.connect(lambda: self._aim_delta(2, self.AIM_STEP))
+        self.btn_m2_set0.clicked.connect(lambda: self._aim_reset_origin(2))
+        self.btn_m2_go0.clicked.connect(lambda: self._aim_go_origin(2))
+        
+        self.btn_raw.clicked.connect(self._send_raw)
+        self.btn_status.clicked.connect(self._send_status)
+        self.input_raw.returnPressed.connect(self._send_raw)
+
+        # 動態生成 Presets 按鈕
+        for i in range(9):
+            btn = QPushButton(f"槽{i+1}")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda checked, idx=i+1: self._select_file_slot(idx))
+            self.grid_files.addWidget(btn, i // 3, i % 3)
+            
+        for j in range(10):
+            btn = QPushButton(f"P{j+1}")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda checked, idx=j+1: self._param_click(idx))
+            self.grid_params.addWidget(btn, j // 5, j % 5)
+
+    def _ensure_preset_dir(self):
+        if not os.path.isdir(PRESET_DIR):
+            try:
+                os.makedirs(PRESET_DIR, exist_ok=True)
+            except: pass
+
+    def keyPressEvent(self, event):
+        if event.isAutoRepeat(): return
+        self._handle_key(event, True)
+    
+    def keyReleaseEvent(self, event):
+        if event.isAutoRepeat(): return
+        self._handle_key(event, False)
+
+    def _handle_key(self, event, is_press):
+        key = event.key()
+        txt = event.text().lower()
+        updated = False
+        
+        if txt == 'w': self.keys['w'] = is_press; updated = True
+        elif txt == 's': self.keys['s'] = is_press; updated = True
+        elif txt == 'a': self.keys['a'] = is_press; updated = True
+        elif txt == 'd': self.keys['d'] = is_press; updated = True
+        elif key == Qt.Key.Key_Left: self.keys['left'] = is_press; updated = True
+        elif key == Qt.Key.Key_Right: self.keys['right'] = is_press; updated = True
+        
+        if updated:
+            self._update_chassis_from_keys()
+            return
+
+        if is_press:
+            if txt == 'f': self._send_step("F")
+            elif txt == 'r': self._send_step("R")
+            elif txt == 'x': self._send_step("S")
+            elif txt == '1': self._send_servo("S1")
+            elif txt == '2': self._send_servo("S2")
+            elif txt == '3': self._send_servo("S3")
+            elif txt == 'l': self._aim_delta(1, self.AIM_STEP)
+            elif txt == 'j': self._aim_delta(1, -self.AIM_STEP)
+            elif txt == 'i': self._aim_delta(2, self.AIM_STEP)
+            elif txt == 'k': self._aim_delta(2, -self.AIM_STEP)
+
+    def _toggle_connect(self):
+        if self.connected:
+            self.client.close()
+            self.connected = False
+            self.lbl_status.setText("未連線")
+            self.lbl_status.setStyleSheet("color: #888888; font-weight: bold;") 
+            self.btn_connect.setText("連線")
+            self.btn_connect.setStyleSheet("")
+            self._append_log("[INFO] disconnected")
+        else:
+            host = self.input_ip.text().strip()
+            try:
+                port = int(self.input_port.text())
+            except ValueError:
+                QMessageBox.warning(self, "警告", "Port 必須是數字")
+                return
+            try:
+                self.client.connect(host, port)
+                self.connected = True
+                self.lbl_status.setText(f"已連線: {host}")
+                self.lbl_status.setStyleSheet("color: #00e676; font-weight: bold;")
+                self.btn_connect.setText("斷線")
+                self.btn_connect.setStyleSheet("background-color: #444; border: 1px solid #f44336;") 
+                self._append_log("[INFO] connected")
+                self.setFocus() 
+            except Exception as e:
+                self._append_log(f"[ERR] Connect fail: {e}")
+                QMessageBox.critical(self, "連線失敗", str(e))
+
+    def _on_client_recv(self, msg):
+        self.log_signal.emit(f"[Pi] {msg}")
+
+    def _append_log(self, txt):
+        self.txt_log.append(txt)
+        sb = self.txt_log.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _send_line_safe(self, cmd):
+        if not self.connected: return
+        try:
+            self.client.send_line(cmd)
+            self._append_log(f"[PC] {cmd}")
+        except Exception as e:
+            self._append_log(f"[ERR] send: {e}")
+            self._toggle_connect()
+
+    def _update_speed_label(self):
+        val = self.slider_speed.value() / 100.0
+        self.lbl_speed_val.setText(f"{val:.2f}")
+        self._update_chassis_from_keys()
+        self.setFocus()
+
+    def _update_chassis_from_keys(self):
+        vx = vy = wz = 0.0
+        if self.keys['w'] and not self.keys['s']: vx = 1.0
+        if self.keys['s'] and not self.keys['w']: vx = -1.0
+        if self.keys['d'] and not self.keys['a']: vy = 1.0
+        if self.keys['a'] and not self.keys['d']: vy = -1.0
+        if self.keys['left'] and not self.keys['right']: wz = -1.0
+        if self.keys['right'] and not self.keys['left']: wz = 1.0
+        
+        sp = self.slider_speed.value() / 100.0
+        self.vx = vx * sp
+        self.vy = vy * sp
+        self.wz = wz * sp
+        
+        style = "color: #00e5ff; font-weight: bold;"
+        self.lbl_vx.setText(f"vx=<span style='{style}'>{self.vx:.2f}</span>")
+        self.lbl_vy.setText(f"vy=<span style='{style}'>{self.vy:.2f}</span>")
+        self.lbl_wz.setText(f"wz=<span style='{style}'>{self.wz:.2f}</span>")
+        
+        if self.connected:
+            cmd = f"CHASSIS {self.vx:.2f} {self.vy:.2f} {self.wz:.2f}"
+            self._send_line_safe(cmd)
+
+    def _send_step(self, sub):
+        self._send_line_safe(f"STEP {sub}")
+
+    def _send_servo(self, sname):
+        self._send_line_safe(f"SERVO {sname}")
+
+    # --- 修改處：直接發送數值的函式 ---
+    def _send_neo_val(self, val):
+        self._send_line_safe(f"NEO {val}")
+    # ------------------------------
+
+    def _send_raw(self):
+        txt = self.input_raw.text().strip()
+        if txt:
+            self._send_line_safe(f"RAW {txt}")
+            self.input_raw.clear()
+
+    def _send_status(self):
+        self._send_line_safe("STATUS")
+
+    def _aim_delta(self, axis, delta):
+        if axis == 1:
+            self.m1_angle += delta
+            val = self.m1_angle
+        else:
+            self.m2_angle += delta
+            val = self.m2_angle
+        self._update_aim_labels()
+        self._send_line_safe(f"AIM {axis} {val:.3f}")
+
+    def _aim_reset_origin(self, axis):
+        if axis == 1: self.m1_angle = 0.0
+        else: self.m2_angle = 0.0
+        self._update_aim_labels()
+        self._append_log(f"[INFO] M{axis} Set Origin (UI reset)")
+
+    def _aim_go_origin(self, axis):
+        if axis == 1: self.m1_angle = 0.0
+        else: self.m2_angle = 0.0
+        self._update_aim_labels()
+        self._send_line_safe(f"AIM {axis} 0")
+
+    def _update_aim_labels(self):
+        self.lbl_m1.setText(f"M1 = {self.m1_angle:.1f}°")
+        self.lbl_m2.setText(f"M2 = {self.m2_angle:.1f}°")
+
+    def _select_file_slot(self, slot):
+        self.current_file_slot = slot
+        fname = f"preset_{slot}.json"
+        path = os.path.join(PRESET_DIR, fname)
+        
+        if not os.path.exists(path):
+            self.lbl_file_info.setText(f"已選: 槽{slot} (空)")
+            self.lbl_file_info.setStyleSheet("color: #ff4444")
+        else:
+            self.lbl_file_info.setText(f"已選: 槽{slot} -> {fname}")
+            self.lbl_file_info.setStyleSheet("color: #00e5ff")
+            
+        self.lbl_param_info.setText("未選擇參數")
+
+    def _param_click(self, idx):
+        if self.current_file_slot is None:
+            QMessageBox.warning(self, "提示", "請先選擇檔案槽")
+            return
+        
+        fname = f"preset_{self.current_file_slot}.json"
+        path = os.path.join(PRESET_DIR, fname)
+        
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            item = data[idx-1] 
+            
+            m1 = m2 = 0
+            if isinstance(item, list) or isinstance(item, tuple):
+                m1, m2 = float(item[0]), float(item[1])
+            elif isinstance(item, dict):
+                m1 = float(item.get("m1", item.get("M1", 0)))
+                m2 = float(item.get("m2", item.get("M2", 0)))
+            
+            self.m1_angle = m1
+            self.m2_angle = m2
+            self._update_aim_labels()
+            self.lbl_param_info.setText(f"P{idx}: M1={m1:.2f}, M2={m2:.2f}")
+            self.lbl_param_info.setStyleSheet("color: #00e5ff; font-weight: bold;")
+            
+            self._send_line_safe(f"AIM 1 {m1:.3f}")
+            self._send_line_safe(f"AIM 2 {m2:.3f}")
+            
+        except Exception as e:
+            self.lbl_param_info.setText(f"讀取失敗: {e}")
+            self.lbl_param_info.setStyleSheet("color: #ff4444;")
+
+    def closeEvent(self, event):
+        self.client.close()
+        event.accept()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+================================================================================
+FILE: remote_layout.ui
+================================================================================
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>850</width>
+    <height>800</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Laptop Remote Controller (Dark UI)</string>
+  </property>
+  <property name="styleSheet">
+   <string notr="true">
+/* 全域設定 */
+QMainWindow {
+    background-color: #1e1e1e;
+    color: #e0e0e0;
+    font-family: &quot;Segoe UI&quot;, &quot;Microsoft JhengHei&quot;, sans-serif;
+    font-size: 10pt;
+}
+
+/* 群組框 */
+QGroupBox {
+    border: 1px solid #444;
+    border-radius: 6px;
+    margin-top: 24px;
+    padding-top: 10px;
+    background-color: #252526;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    padding: 0 5px;
+    color: #00e5ff;
+    font-weight: bold;
+    background-color: #1e1e1e;
+}
+
+/* 標籤 */
+QLabel {
+    color: #cccccc;
+}
+
+/* 輸入框 */
+QLineEdit {
+    background-color: #2d2d30;
+    border: 1px solid #3e3e42;
+    border-radius: 4px;
+    color: #ffffff;
+    padding: 4px;
+    font-family: &quot;Consolas&quot;, monospace;
+}
+QLineEdit:focus {
+    border: 1px solid #007acc;
+}
+
+/* 按鈕 - 通用 */
+QPushButton {
+    background-color: #3e3e42;
+    color: #ffffff;
+    border: 1px solid #555;
+    border-radius: 4px;
+    padding: 6px 12px;
+    min-width: 60px;
+}
+QPushButton:hover {
+    background-color: #505050;
+    border-color: #00e5ff;
+}
+QPushButton:pressed {
+    background-color: #007acc;
+    border-color: #007acc;
+}
+
+/* 特殊按鈕 ID 指定 */
+QPushButton#btn_connect {
+    background-color: #007acc;
+    font-weight: bold;
+}
+QPushButton#btn_connect:hover {
+    background-color: #0098ff;
+}
+
+QPushButton#btn_step_s {
+    background-color: #d32f2f;
+    font-weight: bold;
+}
+QPushButton#btn_step_s:hover {
+    background-color: #f44336;
+}
+
+QPushButton#btn_neo_0, QPushButton#btn_neo_n50, QPushButton#btn_neo_n100, QPushButton#btn_raw, QPushButton#btn_status {
+    background-color: #2d2d30;
+}
+
+/* 滑桿 */
+QSlider::groove:horizontal {
+    border: 1px solid #3e3e42;
+    height: 8px;
+    background: #2d2d30;
+    margin: 2px 0;
+    border-radius: 4px;
+}
+QSlider::handle:horizontal {
+    background: #00e5ff;
+    border: 1px solid #00e5ff;
+    width: 16px;
+    height: 16px;
+    margin: -5px 0;
+    border-radius: 8px;
+}
+
+/* Log 區域 */
+QTextEdit {
+    background-color: #000000;
+    color: #00ff00;
+    font-family: &quot;Consolas&quot;, &quot;Courier New&quot;, monospace;
+    border: 1px solid #333;
+    font-size: 9pt;
+}
+   </string>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="verticalLayout">
+    <item>
+     <layout class="QHBoxLayout" name="layout_conn">
+      <item>
+       <widget class="QLabel" name="label_ip">
+        <property name="text">
+         <string>Pi IP:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLineEdit" name="input_ip">
+        <property name="text">
+         <string>10.254.97.208</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="label_port">
+        <property name="text">
+         <string>Port:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLineEdit" name="input_port">
+        <property name="text">
+         <string>5000</string>
+        </property>
+        <property name="maximumWidth">
+         <number>80</number>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="btn_connect">
+        <property name="text">
+         <string>連線</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="lbl_status">
+        <property name="text">
+         <string>未連線</string>
+        </property>
+        <property name="styleSheet">
+         <string>color: #888888; font-weight: bold;</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <spacer name="horizontalSpacer">
+        <property name="orientation">
+         <enum>Qt::Horizontal</enum>
+        </property>
+        <property name="sizeHint" stdset="0">
+         <size>
+          <width>40</width>
+          <height>20</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+     </layout>
+    </item>
+
+    <item>
+     <widget class="QGroupBox" name="grp_chassis">
+      <property name="title">
+       <string>底盤控制 (W/A/S/D + Arrows)</string>
+      </property>
+      <layout class="QHBoxLayout" name="horizontalLayout_2">
+       <item>
+        <widget class="QLabel" name="label_speed">
+         <property name="text">
+          <string>速度倍率:</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QSlider" name="slider_speed">
+         <property name="orientation">
+          <enum>Qt::Horizontal</enum>
+         </property>
+         <property name="minimum">
+          <number>0</number>
+         </property>
+         <property name="maximum">
+          <number>100</number>
+         </property>
+         <property name="value">
+          <number>60</number>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="lbl_speed_val">
+         <property name="text">
+          <string>0.60</string>
+         </property>
+         <property name="minimumWidth">
+            <number>40</number>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="Line" name="line">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="lbl_vx">
+         <property name="text">
+          <string>vx=0.00</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="lbl_vy">
+         <property name="text">
+          <string>vy=0.00</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="lbl_wz">
+         <property name="text">
+          <string>wz=0.00</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </item>
+
+    <item>
+     <widget class="QGroupBox" name="grp_shooter">
+      <property name="title">
+       <string>Shooter 控制</string>
+      </property>
+      <layout class="QGridLayout" name="gridLayout_shooter">
+       <item row="0" column="0">
+        <widget class="QLabel" name="label_step"><property name="text"><string>步進 (F/R/X):</string></property></widget>
+       </item>
+       <item row="0" column="1">
+        <widget class="QPushButton" name="btn_step_f"><property name="text"><string>F</string></property></widget>
+       </item>
+       <item row="0" column="2">
+        <widget class="QPushButton" name="btn_step_r"><property name="text"><string>R</string></property></widget>
+       </item>
+       <item row="0" column="3">
+        <widget class="QPushButton" name="btn_step_s"><property name="text"><string>Stop (X)</string></property></widget>
+       </item>
+
+       <item row="1" column="0">
+        <widget class="QLabel" name="label_servo"><property name="text"><string>Servo (1/2/3):</string></property></widget>
+       </item>
+       <item row="1" column="1">
+        <widget class="QPushButton" name="btn_servo_1"><property name="text"><string>S1</string></property></widget>
+       </item>
+       <item row="1" column="2">
+        <widget class="QPushButton" name="btn_servo_2"><property name="text"><string>S2</string></property></widget>
+       </item>
+       <item row="1" column="3">
+        <widget class="QPushButton" name="btn_servo_3"><property name="text"><string>S3</string></property></widget>
+       </item>
+
+       <item row="2" column="0">
+        <widget class="QLabel" name="label_neo"><property name="text"><string>NEO 速度:</string></property></widget>
+       </item>
+       <item row="2" column="1">
+        <widget class="QPushButton" name="btn_neo_0"><property name="text"><string>0 (Stop)</string></property></widget>
+       </item>
+       <item row="2" column="2">
+        <widget class="QPushButton" name="btn_neo_n50"><property name="text"><string>-50</string></property></widget>
+       </item>
+       <item row="2" column="3">
+        <widget class="QPushButton" name="btn_neo_n100"><property name="text"><string>-100</string></property></widget>
+       </item>
+      </layout>
+     </widget>
+    </item>
+
+    <item>
+     <widget class="QGroupBox" name="grp_aim">
+      <property name="title">
+       <string>AIM 手動控制 (L/J -> M1, I/K -> M2)</string>
+      </property>
+      <layout class="QGridLayout" name="gridLayout_aim">
+       <item row="0" column="0"><widget class="QLabel" name="lbl_m1"><property name="text"><string>M1 = 0.0°</string></property></widget></item>
+       <item row="0" column="1"><widget class="QPushButton" name="btn_m1_dec"><property name="text"><string>M1 -</string></property></widget></item>
+       <item row="0" column="2"><widget class="QPushButton" name="btn_m1_inc"><property name="text"><string>M1 +</string></property></widget></item>
+       <item row="0" column="3"><widget class="QPushButton" name="btn_m1_set0"><property name="text"><string>設為原點</string></property></widget></item>
+       <item row="0" column="4"><widget class="QPushButton" name="btn_m1_go0"><property name="text"><string>回原點</string></property></widget></item>
+
+       <item row="1" column="0"><widget class="QLabel" name="lbl_m2"><property name="text"><string>M2 = 0.0°</string></property></widget></item>
+       <item row="1" column="1"><widget class="QPushButton" name="btn_m2_dec"><property name="text"><string>M2 -</string></property></widget></item>
+       <item row="1" column="2"><widget class="QPushButton" name="btn_m2_inc"><property name="text"><string>M2 +</string></property></widget></item>
+       <item row="1" column="3"><widget class="QPushButton" name="btn_m2_set0"><property name="text"><string>設為原點</string></property></widget></item>
+       <item row="1" column="4"><widget class="QPushButton" name="btn_m2_go0"><property name="text"><string>回原點</string></property></widget></item>
+      </layout>
+     </widget>
+    </item>
+
+    <item>
+     <widget class="QGroupBox" name="grp_presets">
+      <property name="title">
+       <string>AIM 預設角度 (9 檔案槽 + 10 參數)</string>
+      </property>
+      <layout class="QVBoxLayout" name="layout_presets">
+        <item>
+            <widget class="QLabel" name="lbl_file_info">
+                <property name="text"><string>未選擇檔案槽</string></property>
+            </widget>
+        </item>
+        <item>
+            <widget class="QWidget" name="container_file_btns" native="true">
+                <layout class="QGridLayout" name="grid_files"/>
+            </widget>
+        </item>
+        <item>
+            <widget class="QLabel" name="lbl_param_info">
+                <property name="text"><string>未選擇參數</string></property>
+                </widget>
+        </item>
+        <item>
+            <widget class="QWidget" name="container_param_btns" native="true">
+                <layout class="QGridLayout" name="grid_params"/>
+            </widget>
+        </item>
+      </layout>
+     </widget>
+    </item>
+
+    <item>
+      <layout class="QHBoxLayout" name="layout_raw">
+        <item><widget class="QLineEdit" name="input_raw"><property name="placeholderText"><string>RAW 指令...</string></property></widget></item>
+        <item><widget class="QPushButton" name="btn_raw"><property name="text"><string>送出 RAW</string></property></widget></item>
+        <item><widget class="QPushButton" name="btn_status"><property name="text"><string>STATUS</string></property></widget></item>
+      </layout>
+    </item>
+
+    <item>
+     <widget class="QTextEdit" name="txt_log">
+      <property name="readOnly">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+   </layout>
+ </widget>
+</widget>
+ <resources/>
+ <connections/>
+</ui>
 ================================================================================
 FILE: scan_folder.py
 ================================================================================
@@ -360,9 +1448,10 @@ SKIP_DIRS = {
 
 # 當作文字檔處理（小寫副檔名）
 TEXT_EXTS = {
-    ".py",".c",".cpp",".h",".hpp",".java",".js",".ts",".sh",".bat",".ps1",".ino",
-    ".go",".rb",".php",".swift",".kt",".m",".cs",".json",".yml",".yaml",".toml",
-    ".ini",".md",".txt",".csv",".xml",".html",".css"
+    ".py"
+    #,".c",".cpp",".h",".hpp",".java",".js",".ts",".sh",".bat",".ps1",".ino",
+    #".go",".rb",".php",".swift",".kt",".m",".cs",".json",".yml",".yaml",".toml",
+    #".ini",".md",".txt",".csv",".xml",".html",".css"
 }
 
 # 內容輸出控制
@@ -555,81 +1644,1607 @@ if __name__ == "__main__":
     main()
 
 ================================================================================
-FILE: xboxGUI.py
+FILE: yolotest.py
 ================================================================================
-# xboxGUI.py
-# 對外 API：run(handlers)
-# handlers = {
-#   "on_axis":    callable(lx, ly, rx, ry, rot_l, rot_r),  # floats in [-1,1]
-#   "on_buttons": callable(a,b,x,y,lb,rb),                 # bools
-# }
+from ultralytics import YOLO
+import cv2
+import os
 
-import pygame
+# 1. 設定 ONNX 模型路徑
+# 這裡直接指向你剛剛轉好的 onnx 檔案
+onnx_path = r"C:\Users\user\OneDrive - 中原大學\桌面\大學作品集\東京威力\TEL.v2i\runs\detect\train15\weights\best.onnx"
 
-# 常見 XInput 映射（如與你手把不同可在此調整）
-AX_LX, AX_LY, AX_RX, AX_RY, AX_ROT_L, AX_ROT_R = 0, 1, 2, 3, 4, 5
-BTN_A, BTN_B, BTN_X, BTN_Y, BTN_LB, BTN_RB = 0, 1, 2, 3, 4, 5
+print(f"正在檢查路徑: {onnx_path}")
+if not os.path.exists(onnx_path):
+    print("錯誤：找不到 .onnx 檔案！請確認第一步的轉檔是否成功。")
+    exit()
 
-def _dead(v, dz=0.15):
-    return 0.0 if abs(v) < dz else float(v)
+# 2. 載入 ONNX 模型
+# task='detect' 是選填的，但明確指定可以避免部分警告
+print("正在載入 ONNX 模型 (這可能需要幾秒鐘)...")
+try:
+    model = YOLO(onnx_path, task='detect')
+    print("ONNX 模型載入成功！")
+except Exception as e:
+    print(f"載入失敗: {e}")
+    print("請確認你有安裝 onnxruntime: pip install onnx onnxruntime")
+    exit()
 
-def run(handlers: dict, fps: int = 120):
-    on_axis = handlers.get("on_axis")
-    on_btn  = handlers.get("on_buttons")
+# 3. 開啟鏡頭
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    pygame.init()
-    pygame.joystick.init()
+if not cap.isOpened():
+    print("無法開啟攝影機")
+    exit()
 
-    js = None
-    if pygame.joystick.get_count() > 0:
-        js = pygame.joystick.Joystick(0); js.init()
-        print(f"[xboxGUI] Joystick: {js.get_name()}")
-    else:
-        print("[xboxGUI] 找不到搖桿，仍啟動迴圈（回傳全 0）。")
+print("=== ONNX 推論測試開始 (按 'q' 離開) ===")
 
-    clock = pygame.time.Clock()
-    a = b = x = y = lb = rb = False
+while True:
+    success, frame = cap.read()
+    if not success:
+        break
 
-    while True:
-        for e in pygame.event.get():
-            if e.type == pygame.QUIT:
-                return
-            if e.type == pygame.JOYBUTTONDOWN:
-                if e.button == BTN_A: a = True
-                elif e.button == BTN_B: b = True
-                elif e.button == BTN_X: x = True
-                elif e.button == BTN_Y: y = True
-                elif e.button == BTN_LB: lb = True
-                elif e.button == BTN_RB: rb = True
-            if e.type == pygame.JOYBUTTONUP:
-                if e.button == BTN_A: a = False
-                elif e.button == BTN_B: b = False
-                elif e.button == BTN_X: x = False
-                elif e.button == BTN_Y: y = False
-                elif e.button == BTN_LB: lb = False
-                elif e.button == BTN_RB: rb = False
+    # 4. 推論
+    # 使用 ONNX 時，Ultralytics 內部會自動呼叫 onnxruntime
+    results = model.predict(frame, conf=0.4, verbose=False)
 
-        if js:
-            lx     = _dead(js.get_axis(AX_LX))
-            ly     = _dead(js.get_axis(AX_LY))
-            rx     = _dead(js.get_axis(AX_RX))
-            ry     = _dead(js.get_axis(AX_RY))
-            rot_l  = float(js.get_axis(AX_ROT_L))  # 多數觸發鍵：鬆開≈-1、壓到底≈+1
-            rot_r  = float(js.get_axis(AX_ROT_R))
+    # 5. 繪圖與顯示
+    annotated_frame = results[0].plot()
+    
+    # 加上標示確認我們正在用 ONNX
+    cv2.putText(annotated_frame, "Mode: ONNX", (10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+    cv2.imshow("YOLOv8 ONNX Test", annotated_frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+================================================================================
+FILE: aim\aim.ino
+================================================================================
+/*******************************************************
+ * Arduino：雙軸步進控制 (修正版)
+ * 格式1：1,角度 或 2,角度 (絕對座標定位)
+ * 格式2：left,速度 或 right,速度 (M1 連續旋轉，直到 stop 或 +-80度)
+ * 指令 stop：停止連續旋轉
+ * 輸出：轉動時持續回傳 degree:M1角度,M2角度
+ *******************************************************/
+#include <Arduino.h>
+
+struct StepperAxis {
+  int PUL, DIR, ENA;
+  bool DIR_INVERT;        // true=反向
+  bool ENA_ACTIVE_HIGH;   // true=HIGH為使能
+  double currentAngle;    // 目前角度
+  long stepsPerRev;       // 每圈步數
+  int speed_us;           // 預設速度
+};
+
+// === 腳位 ===
+const int M1_PUL = 13, M1_DIR = 12, M1_ENA = 11;
+const int M2_PUL = 10, M2_DIR = 9,  M2_ENA = 8;
+
+// === 參數 ===
+const long M1_STEPS_PER_REV = 42667L;
+const long M2_STEPS_PER_REV = 57600L;
+const float LIMIT_MAX = 80.0;
+const float LIMIT_MIN = -80.0;
+
+StepperAxis m1 = { M1_PUL, M1_DIR, M1_ENA, false,  true, 0.0, M1_STEPS_PER_REV, 100 };
+StepperAxis m2 = { M2_PUL, M2_DIR, M2_ENA, true,  true, 0.0, M2_STEPS_PER_REV, 100 };
+
+unsigned long lastPrintTime = 0; 
+
+// === 函式宣告 (這裡修正了) ===
+// C++ 規則：預設參數只能在宣告時寫一次
+void reportStatus(bool force = false); 
+static inline void holdEnable(const StepperAxis& ax, bool on);
+void setupAxis(const StepperAxis& ax);
+void stepOnePulse(StepperAxis& ax, int currentSpeedUs);
+void runContinuous(StepperAxis& ax, int direction, int speedVal);
+void moveToAngle(StepperAxis& ax, float targetAngle);
+
+void setup() {
+  Serial.begin(115200);
+  setupAxis(m1);
+  setupAxis(m2);
+  Serial.println(F("就緒："));
+  Serial.println(F("1. 定位模式: 1,角度 或 2,角度"));
+  Serial.println(F("2. 連續模式: left,50 或 right,50 (M1移動)"));
+  Serial.println(F("3. 停止: stop"));
+}
+
+void loop() {
+  if (!Serial.available()) return;
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  // 1. 處理 stop
+  if (cmd.equalsIgnoreCase("stop")) {
+    Serial.println(F("Stopped."));
+    return;
+  }
+
+  // 2. 處理 left/right (連續移動模式)
+  if (cmd.startsWith("left") || cmd.startsWith("right")) {
+    int comma = cmd.indexOf(',');
+    int spd = 50; 
+    if (comma > 0) {
+      spd = cmd.substring(comma + 1).toInt();
+    }
+    
+    bool goRight = cmd.startsWith("right");
+    int direction = goRight ? 1 : -1;
+    
+    runContinuous(m1, direction, spd);
+    return;
+  }
+
+  // 3. 處理 1,角度 或 2,角度 (絕對定位)
+  int comma = cmd.indexOf(',');
+  if (comma > 0) {
+    int axisId = cmd.substring(0, comma).toInt();
+    float targetAngle = cmd.substring(comma + 1).toFloat();
+
+    if (axisId == 1) {
+      moveToAngle(m1, targetAngle);
+      Serial.println(F("M1 OK"));
+    } else if (axisId == 2) {
+      moveToAngle(m2, targetAngle);
+      Serial.println(F("M2 OK"));
+    }
+  } else {
+    Serial.println(F("❌ 格式錯誤"));
+  }
+}
+
+// === 輔助功能 ===
+
+// 回報角度 (修正：這裡拿掉 = false)
+void reportStatus(bool force) {
+  if (force || (millis() - lastPrintTime > 200)) {
+    Serial.print("degree:");
+    Serial.print(m1.currentAngle, 2);
+    Serial.print(",");
+    Serial.println(m2.currentAngle, 2);
+    lastPrintTime = millis();
+  }
+}
+
+static inline void holdEnable(const StepperAxis& ax, bool on) {
+  digitalWrite(ax.ENA, on ? (ax.ENA_ACTIVE_HIGH ? HIGH : LOW)
+                          : (ax.ENA_ACTIVE_HIGH ? LOW  : HIGH));
+}
+
+void setupAxis(const StepperAxis& ax) {
+  pinMode(ax.PUL, OUTPUT);
+  pinMode(ax.DIR, OUTPUT);
+  pinMode(ax.ENA, OUTPUT);
+  holdEnable(ax, true); 
+}
+
+void stepOnePulse(StepperAxis& ax, int currentSpeedUs) {
+  digitalWrite(ax.PUL, HIGH);
+  delayMicroseconds(currentSpeedUs);
+  digitalWrite(ax.PUL, LOW);
+  delayMicroseconds(currentSpeedUs);
+}
+
+// === 核心運動邏輯 ===
+
+// 模式 A: 連續旋轉
+void runContinuous(StepperAxis& ax, int direction, int speedVal) {
+  Serial.println(F("Start Continuous Move..."));
+  
+  bool dirPinState = (direction > 0); 
+  if (ax.DIR_INVERT) dirPinState = !dirPinState;
+  digitalWrite(ax.DIR, dirPinState ? HIGH : LOW);
+  
+  holdEnable(ax, true);
+
+  double anglePerStep = 360.0 / (double)ax.stepsPerRev;
+  
+  while (true) {
+    if (Serial.available()) {
+      String stopCmd = Serial.readStringUntil('\n');
+      stopCmd.trim();
+      if (stopCmd.equalsIgnoreCase("stop")) {
+        Serial.println(F("Command Stop received."));
+        break;
+      }
+    }
+
+    if (ax.currentAngle >= LIMIT_MAX && direction > 0) {
+      Serial.println(F("Limit +80 reached."));
+      break;
+    }
+    if (ax.currentAngle <= LIMIT_MIN && direction < 0) {
+      Serial.println(F("Limit -80 reached."));
+      break;
+    }
+
+    stepOnePulse(ax, speedVal);
+    ax.currentAngle += (direction * anglePerStep);
+
+    reportStatus(); // 這裡使用預設參數
+  }
+}
+
+// 模式 B: 絕對定位
+void moveToAngle(StepperAxis& ax, float targetAngle) {
+  float diff = targetAngle - ax.currentAngle;
+  long stepsToMove = (long)(fabs(diff) * ((double)ax.stepsPerRev / 360.0) + 0.5);
+  
+  if (stepsToMove <= 0) { 
+    ax.currentAngle = targetAngle; 
+    return; 
+  }
+
+  bool dirLogical = (diff >= 0);
+  int direction = dirLogical ? 1 : -1;
+
+  if (ax.DIR_INVERT) dirLogical = !dirLogical;
+  digitalWrite(ax.DIR, dirLogical ? HIGH : LOW);
+
+  holdEnable(ax, true);
+
+  double anglePerStep = 360.0 / (double)ax.stepsPerRev;
+
+  for (long i = 0; i < stepsToMove; i++) {
+    stepOnePulse(ax, ax.speed_us);
+    ax.currentAngle += (direction * anglePerStep);
+    
+    if (Serial.available()) {
+       String s = Serial.peek() != -1 ? Serial.readStringUntil('\n') : "";
+       if (s.indexOf("stop") >= 0) {
+         Serial.println(F("Interrupted by stop"));
+         break;
+       }
+    }
+
+    reportStatus();
+  }
+  ax.currentAngle = targetAngle;
+  reportStatus(true);
+}
+================================================================================
+FILE: chassis_shooter\chassis_shooter.ino
+================================================================================
+// chassis_shooter.ino
+// 單一韌體，板上分流兩種模式以降低負荷：
+//   模式 CHASSIS：只跑麥輪底盤（vx,vy,wz）
+//   模式 SHOOTER：只跑 NEO + 步進（整數 -100..100, F/R/S）
+//
+// 串列指令 (無 TOKEN；相容舊有 <11323310> 前綴會自動剝除) ：
+//   MODE CHASSIS          切換到底盤模式（並關閉發射模組）
+//   MODE SHOOTER          切換到發射模式（並關閉底盤）
+//   STATUS                顯示目前模式與該模式的狀態
+//   STOP                  依模式停當前子系統：CHASSIS 停車；SHOOTER 停步進+NEO=0
+//   vx,vy,wz              僅 CHASSIS 模式有效 (範圍建議 -1..1)
+//   F / R / S             僅 SHOOTER 模式有效（步進 前/反/停(抱死)）
+//   -100..100             僅 SHOOTER 模式有效（NEO 速度）
+//
+// 新增：
+//   S1 / S2 / S3          僅 SHOOTER 模式有效（pin10 Servo 轉到 60 / 90 / 120 度）
+//
+// 降負荷重點：
+//  - 僅在 CHASSIS 模式執行 rampUpdateAndApply() 與底盤 telemetry
+//  - 僅在 SHOOTER 模式執行 serviceStepper()（步進脈衝）與 NEO Servo（attach）
+//  - 切到 CHASSIS 會 detach Servo（釋放計時器中斷），步進 ENA=HIGH（抱死、停脈衝）
+//  - 切到 SHOOTER 會 stopAll() 關閉所有底盤 PWM
+//  - Telemetry 僅輸出當前模式的必要資訊
+
+#include <Arduino.h>
+#include <math.h>
+#include <Servo.h>
+
+// ================== 角度 Servo（pin10，新增） ==================
+Servo servoAngle;   // 專門控制 pin10 的 Servo（S1/S2/S3）
+
+// ================== 模式定義 ==================
+enum Mode { MODE_CHASSIS = 0, MODE_SHOOTER = 1 };
+volatile Mode g_mode = MODE_CHASSIS;
+
+// ================== CHASSIS（麥輪） ==================
+// Pins (MEGA)
+const uint8_t M1_PWM_A_PIN = 2;  // 前左 index 0
+const uint8_t M1_PWM_B_PIN = 3;
+const uint8_t M2_PWM_A_PIN = 4;  // 左後 index 1
+const uint8_t M2_PWM_B_PIN = 5;
+const uint8_t M3_PWM_A_PIN = 7;  // 右前 index 2
+const uint8_t M3_PWM_B_PIN = 6;
+const uint8_t M4_PWM_A_PIN = 8;  // 右後 index 3
+const uint8_t M4_PWM_B_PIN = 9;
+const uint8_t servo = 10;
+
+const int   MIN_PWM   = 80;
+const int   MAX_PWM   = 255;
+const float RAMP_STEP = 6.0;
+const float DEAD_BAND = 0.02;
+const float K_OMEGA   = 0.5;
+
+float currentPWMvals[4] = {0,0,0,0};
+float targetPWMvals[4]  = {0,0,0,0};
+bool  motorActive       = false;
+
+// ================== SHOOTER（NEO + 步進） ==================
+Servo sparkMax;
+const int SPARK_PWM_PIN = 13;     // NEO (Spark MAX) PWM
+bool servoAttached = false;
+int  neoSpeed = 0;                // -100..100（僅作狀態記錄）
+
+const int PUL = 53;
+const int DIR = 52;
+const int ENA = 51;
+const unsigned int PULSE_US = 25;
+
+enum StepState { STEP_STOP=0, STEP_FWD, STEP_REV };
+volatile StepState stepState = STEP_STOP;
+unsigned long lastToggleMicros = 0;
+bool pulseLevel = false;
+
+// ================== 共用 ==================
+String serialBuf = "";
+unsigned long lastTelemetryMs = 0;
+const unsigned long TELE_CHASSIS_MS = 200UL;
+const unsigned long TELE_SHOOTER_MS = 400UL; // 發射端資訊較少，頻率可放慢
+unsigned long lastTeleBudgetMs = 0;
+
+bool equalsIgnoreCase(const String& a, const char* b) {
+  String t=a; t.toUpperCase(); String u=String(b); u.toUpperCase(); return t==u;
+}
+
+// ------------------ CHASSIS 函式 ------------------
+void stopAllChassis() {
+  analogWrite(M1_PWM_A_PIN,0); analogWrite(M1_PWM_B_PIN,0);
+  analogWrite(M2_PWM_A_PIN,0); analogWrite(M2_PWM_B_PIN,0);
+  analogWrite(M3_PWM_A_PIN,0); analogWrite(M3_PWM_B_PIN,0);
+  analogWrite(M4_PWM_A_PIN,0); analogWrite(M4_PWM_B_PIN,0);
+  for (int i=0;i<4;i++){ currentPWMvals[i]=0; targetPWMvals[i]=0; }
+  motorActive=false;
+  Serial.println("🛑 CHASSIS stop");
+}
+
+void applyMotorDirect(int idx, int pwm_abs, bool forward) {
+  switch(idx){
+    case 0: if(forward){ analogWrite(M1_PWM_A_PIN,pwm_abs); analogWrite(M1_PWM_B_PIN,0);} else { analogWrite(M1_PWM_A_PIN,0); analogWrite(M1_PWM_B_PIN,pwm_abs);} break;
+    case 1: if(forward){ analogWrite(M2_PWM_A_PIN,pwm_abs); analogWrite(M2_PWM_B_PIN,0);} else { analogWrite(M2_PWM_A_PIN,0); analogWrite(M2_PWM_B_PIN,pwm_abs);} break;
+    case 2: if(forward){ analogWrite(M3_PWM_A_PIN,pwm_abs); analogWrite(M3_PWM_B_PIN,0);} else { analogWrite(M3_PWM_A_PIN,0); analogWrite(M3_PWM_B_PIN,pwm_abs);} break;
+    case 3: if(forward){ analogWrite(M4_PWM_A_PIN,pwm_abs); analogWrite(M4_PWM_B_PIN,0);} else { analogWrite(M4_PWM_A_PIN,0); analogWrite(M4_PWM_B_PIN,pwm_abs);} break;
+  }
+}
+
+void applyWheelCommand(float w0,float w1,float w2,float w3){
+  float a[4]={w0,w1,w2,w3}; float maxv=0.0001f;
+  // 固定反向（依你的接線）：前左、右前反向
+  a[0]=-a[0]; a[2]=-a[2];
+  for(int i=0;i<4;i++){ if(fabs(a[i])<DEAD_BAND) a[i]=0; if(fabs(a[i])>maxv) maxv=fabs(a[i]); }
+  if(maxv>1.0f) for(int i=0;i<4;i++) a[i]/=maxv;
+  for(int i=0;i<4;i++){
+    float mag=fabs(a[i]);
+    if(mag<DEAD_BAND) targetPWMvals[i]=0;
+    else {
+      float pwm=MIN_PWM+(MAX_PWM-MIN_PWM)*mag;
+      targetPWMvals[i]=(a[i]>=0)?pwm:-pwm;
+    }
+  }
+  motorActive=true;
+}
+
+void rampUpdateAndApply(){
+  if (g_mode != MODE_CHASSIS) return; // 非底盤模式，不做任何 PWM 更新
+  for(int i=0;i<4;i++){
+    float cur=currentPWMvals[i], tgt=targetPWMvals[i];
+    if (fabs(tgt-cur)<=RAMP_STEP) cur=tgt; else cur += (tgt>cur)?RAMP_STEP:-RAMP_STEP;
+    currentPWMvals[i]=cur;
+    if (fabs(cur)<1.0){
+      switch(i){
+        case 0: analogWrite(M1_PWM_A_PIN,0); analogWrite(M1_PWM_B_PIN,0); break;
+        case 1: analogWrite(M2_PWM_A_PIN,0); analogWrite(M2_PWM_B_PIN,0); break;
+        case 2: analogWrite(M3_PWM_A_PIN,0); analogWrite(M3_PWM_B_PIN,0); break;
+        case 3: analogWrite(M4_PWM_A_PIN,0); analogWrite(M4_PWM_B_PIN,0); break;
+      }
+    }else{
+      applyMotorDirect(i,(int)fabs(cur),(cur>0));
+    }
+  }
+}
+
+void mecanum_from_cmd(float vx,float vy,float wz,float out[4]){
+  // 機體朝向補償：等效順時針 +90° → (vx_r,vy_r)=(-vy, vx)
+  float vx_r=-vy, vy_r=vx;
+  float wFL=vx_r - vy_r - K_OMEGA*wz;
+  float wFR=vx_r + vy_r + K_OMEGA*wz;
+  float wRL=vx_r + vy_r - K_OMEGA*wz;
+  float wRR=vx_r - vy_r + K_OMEGA*wz;
+  float m=max(max(fabs(wFL),fabs(wFR)),max(fabs(wRL),fabs(wRR)));
+  if(m>1.0f){ wFL/=m; wFR/=m; wRL/=m; wRR/=m; }
+  out[0]=wFL; out[1]=wFR; out[2]=wRL; out[3]=wRR;
+}
+
+// ------------------ SHOOTER 函式 ------------------
+void ensureServo(bool wantAttach){
+  if (wantAttach && !servoAttached){
+    sparkMax.attach(SPARK_PWM_PIN);
+    servoAttached = true;
+  } else if (!wantAttach && servoAttached){
+    sparkMax.detach();
+    servoAttached = false;
+  }
+}
+
+void setSparkSpeed(int speed){
+  neoSpeed = speed;
+  if (!servoAttached) return; // 非 SHOOTER 模式時不送脈衝
+  int us = map(speed, -100, 100, 1000, 2000);
+  sparkMax.writeMicroseconds(us);
+  Serial.print("NEO="); Serial.print(speed);
+  Serial.print(" pwm(us)="); Serial.println(us);
+}
+
+void startForward(){ digitalWrite(DIR,HIGH); stepState=STEP_FWD; Serial.println("STEP=F"); }
+void startReverse(){ digitalWrite(DIR,LOW);  stepState=STEP_REV; Serial.println("STEP=R"); }
+void stopStepper(){ stepState=STEP_STOP; pulseLevel=false; digitalWrite(PUL,LOW); digitalWrite(ENA,HIGH); Serial.println("STEP=S (hold)"); }
+
+void serviceStepper(){
+  if (g_mode != MODE_SHOOTER) return;           // 非發射模式，不產生脈衝
+  if (stepState == STEP_STOP) return;           // 停止狀態不占用 CPU
+  unsigned long now=micros();
+  if ((unsigned long)(now - lastToggleMicros) >= PULSE_US){
+    pulseLevel=!pulseLevel;
+    digitalWrite(PUL, pulseLevel?HIGH:LOW);
+    lastToggleMicros=now;
+  }
+}
+
+// ------------------ Telemetry ------------------
+void tele_chassis(){
+  Serial.print("TELE-CH: cur[");
+  for(int i=0;i<4;i++){ if(i) Serial.print(","); Serial.print(currentPWMvals[i],1); }
+  Serial.print("] tgt[");
+  for(int i=0;i<4;i++){ if(i) Serial.print(","); Serial.print(targetPWMvals[i],1); }
+  Serial.println("]");
+}
+void tele_shooter(){
+  Serial.print("TELE-SH: NEO="); Serial.print(neoSpeed);
+  Serial.print(" STEP=");
+  Serial.println(stepState==STEP_STOP?"STOP":(stepState==STEP_FWD?"FWD":"REV"));
+}
+
+// ------------------ 模式切換 ------------------
+void enterChassisMode(){
+  // 關閉發射子系統
+  stopStepper();                 // ENA=HIGH 抱死
+  ensureServo(false);            // detach Servo，釋放計時器中斷
+  setSparkSpeed(0);              // 更新邏輯值，實際輸出因已 detach 不會送
+  // 底盤安全歸零
+  stopAllChassis();
+  g_mode = MODE_CHASSIS;
+  lastTelemetryMs = millis();
+  Serial.println(">> MODE=CHASSIS");
+}
+
+void enterShooterMode(){
+  // 關閉底盤輸出
+  stopAllChassis();
+  // 啟動發射子系統
+  ensureServo(true);             // attach Servo
+  digitalWrite(ENA,HIGH);        // 上電預設抱死
+  g_mode = MODE_SHOOTER;
+  lastTelemetryMs = millis();
+  Serial.println(">> MODE=SHOOTER");
+}
+
+// ------------------ 狀態印出 ------------------
+void print_status(){
+  Serial.println("=== STATUS ===");
+  Serial.print("MODE: "); Serial.println(g_mode==MODE_CHASSIS?"CHASSIS":"SHOOTER");
+  if (g_mode==MODE_CHASSIS){
+    Serial.print("motorActive: "); Serial.println(motorActive?"YES":"NO");
+    for (int i=0;i<4;i++){
+      Serial.print("cur[");Serial.print(i);Serial.print("]=");Serial.print(currentPWMvals[i],1);
+      Serial.print(" tgt[");Serial.print(i);Serial.print("]=");Serial.println(targetPWMvals[i],1);
+    }
+  } else {
+    Serial.print("NEO speed: "); Serial.println(neoSpeed);
+    Serial.print("STEP state: "); Serial.println(stepState==STEP_STOP?"STOP":(stepState==STEP_FWD?"FWD":"REV"));
+  }
+  Serial.println("=============");
+}
+
+// ------------------ 指令處理 ------------------
+void process_cmd_vel(String &msg){
+  // 僅 CHASSIS 模式有效
+  if (g_mode != MODE_CHASSIS) { Serial.println("IGNORED: vx,vy,wz (MODE!=CHASSIS)"); return; }
+  char buf[128]; msg.toCharArray(buf,sizeof(buf));
+  char *p=strtok(buf,","); float vx=0,vy=0,wz=0;
+  if(p) vx=atof(p);
+  p=strtok(NULL,","); if(p) vy=atof(p);
+  p=strtok(NULL,","); if(p) wz=atof(p);
+  float out[4]; mecanum_from_cmd(vx,vy,wz,out); applyWheelCommand(out[0],out[1],out[2],out[3]);
+}
+
+void handle_line(String line){
+  line.trim();
+  if (!line.length()) return;
+
+  // 相容舊 TOKEN：若前綴 <11323310>，剝掉
+  const String LEGACY = "<11323310>";
+  if (line.startsWith(LEGACY)) { line = line.substring(LEGACY.length()); line.trim(); }
+
+  // 模式切換
+  if (line.equalsIgnoreCase("MODE CHASSIS")) { enterChassisMode(); return; }
+  if (line.equalsIgnoreCase("MODE SHOOTER")) { enterShooterMode(); return; }
+
+  // 通用
+  if (line.equalsIgnoreCase("STATUS")) { print_status(); return; }
+  if (line.equalsIgnoreCase("STOP")) {
+    if (g_mode==MODE_CHASSIS) stopAllChassis();
+    else { stopStepper(); setSparkSpeed(0); if (servoAttached) sparkMax.writeMicroseconds(1500); }
+    Serial.println("🛑 STOP (current mode)");
+    return;
+  }
+
+  // 依模式解譯
+  if (g_mode==MODE_CHASSIS){
+    // 只處理 vx,vy,wz
+    if (line.indexOf(',')>=0) { process_cmd_vel(line); return; }
+    Serial.println("IGNORED (CHASSIS): not vx,vy,wz");
+    return;
+  } else {
+    // SHOOTER：F/R/S / S1/S2/S3 / 整數
+    if (equalsIgnoreCase(line,"F")) { startForward(); return; }
+    if (equalsIgnoreCase(line,"R")) { startReverse(); return; }
+    if (equalsIgnoreCase(line,"S")) { stopStepper();  return; }
+
+    // ★ 新增：S1 / S2 / S3 控制 pin10 的 Servo 角度
+    if (equalsIgnoreCase(line,"S1")) { servoAngle.write(60);  Serial.println("SERVO=60");  return; }
+    if (equalsIgnoreCase(line,"S2")) { servoAngle.write(90);  Serial.println("SERVO=90");  return; }
+    if (equalsIgnoreCase(line,"S3")) { servoAngle.write(120); Serial.println("SERVO=120"); return; }
+
+    // 其餘視為 NEO 速度
+    long spd = line.toInt();
+    if (spd>100) spd=100; if (spd<-100) spd=-100;
+    setSparkSpeed((int)spd);
+    return;
+  }
+}
+
+// ================== setup / loop ==================
+void setup(){
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n=== MEGA Multiplex (CHASSIS / SHOOTER) NoToken ===");
+
+  // 底盤腳位
+  pinMode(M1_PWM_A_PIN, OUTPUT); pinMode(M1_PWM_B_PIN, OUTPUT);
+  pinMode(M2_PWM_A_PIN, OUTPUT); pinMode(M2_PWM_B_PIN, OUTPUT);
+  pinMode(M3_PWM_A_PIN, OUTPUT); pinMode(M3_PWM_B_PIN, OUTPUT);
+  pinMode(M4_PWM_A_PIN, OUTPUT); pinMode(M4_PWM_B_PIN, OUTPUT);
+  pinMode(servo, OUTPUT);
+
+  // 步進腳位
+  pinMode(PUL,OUTPUT); pinMode(DIR,OUTPUT); pinMode(ENA,OUTPUT);
+  digitalWrite(PUL,LOW); digitalWrite(ENA,HIGH); // 先抱死
+
+  // 初始進 CHASSIS，並確保發射子系統關閉
+  ensureServo(false);
+  enterChassisMode();
+
+  // ★ 新增：pin10 Servo 初始化
+  servoAngle.attach(servo);   // 或直接寫 10
+  servoAngle.write(90);       // 預設 90 度
+
+  Serial.println("用法：MODE CHASSIS / MODE SHOOTER / STATUS / STOP / vx,vy,wz / F/R/S / S1/S2/S3 / -100..100");
+}
+
+void loop(){
+  // 只跑當前模式的服務
+  if (g_mode==MODE_CHASSIS){
+    // 無需處理步進；NEO Servo 已 detach
+  } else {
+    // 發射模式：處理步進脈衝
+    serviceStepper();
+  }
+
+  // 收指令（\n 為一行）
+  while (Serial.available()){
+    char c=(char)Serial.read(); if (c=='\r') continue;
+    if (c=='\n'){ String line=serialBuf; serialBuf=""; handle_line(line); }
+    else {
+      serialBuf += c;
+      if (serialBuf.length()>200) serialBuf=serialBuf.substring(serialBuf.length()-200);
+    }
+  }
+
+  // 僅在 CHASSIS 模式更新 PWM
+  if (g_mode==MODE_CHASSIS) rampUpdateAndApply();
+
+  // Telemetry（各模式各自頻率）
+  unsigned long now = millis();
+  if (g_mode==MODE_CHASSIS){
+    if (now - lastTelemetryMs >= TELE_CHASSIS_MS){ lastTelemetryMs = now; tele_chassis(); }
+  } else {
+    if (now - lastTelemetryMs >= TELE_SHOOTER_MS){ lastTelemetryMs = now; tele_shooter(); }
+  }
+}
+
+================================================================================
+FILE: presets\preset_1.json
+================================================================================
+[
+  [20, 20],
+  [-20, 30],
+  [35, 10],
+  [-35, 35],
+  [15, 8],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0]
+]
+
+================================================================================
+FILE: presets\preset_2.json
+================================================================================
+[
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0]
+]
+
+================================================================================
+FILE: presets\preset_3.json
+================================================================================
+[
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0]
+]
+
+================================================================================
+FILE: presets\preset_4.json
+================================================================================
+[
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0]
+]
+
+================================================================================
+FILE: presets\preset_5.json
+================================================================================
+[
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0]
+]
+
+================================================================================
+FILE: presets\preset_6.json
+================================================================================
+[
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0]
+]
+
+================================================================================
+FILE: presets\preset_7.json
+================================================================================
+[
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0]
+]
+
+================================================================================
+FILE: presets\preset_8.json
+================================================================================
+[
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0]
+]
+
+================================================================================
+FILE: presets\preset_9.json
+================================================================================
+[
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0],
+  [0, 0]
+]
+
+================================================================================
+FILE: runs\detect\tel_nano\args.yaml
+================================================================================
+task: detect
+mode: train
+model: yolo11n.pt
+data: C:\Users\user\OneDrive - 中原大學\桌面\大學作品集\東京威力\TEL.v2i\data.yaml
+epochs: 100
+time: null
+patience: 100
+batch: 16
+imgsz: 640
+save: true
+save_period: -1
+cache: false
+device: '0'
+workers: 8
+project: null
+name: tel_nano
+exist_ok: false
+pretrained: true
+optimizer: auto
+verbose: true
+seed: 0
+deterministic: true
+single_cls: false
+rect: false
+cos_lr: false
+close_mosaic: 10
+resume: false
+amp: true
+fraction: 1.0
+profile: false
+freeze: null
+multi_scale: false
+overlap_mask: true
+mask_ratio: 4
+dropout: 0.0
+val: true
+split: val
+save_json: false
+conf: null
+iou: 0.7
+max_det: 300
+half: false
+dnn: false
+plots: true
+source: null
+vid_stride: 1
+stream_buffer: false
+visualize: false
+augment: false
+agnostic_nms: false
+classes: null
+retina_masks: false
+embed: null
+show: false
+save_frames: false
+save_txt: false
+save_conf: false
+save_crop: false
+show_labels: true
+show_conf: true
+show_boxes: true
+line_width: null
+format: torchscript
+keras: false
+optimize: false
+int8: false
+dynamic: false
+simplify: true
+opset: null
+workspace: null
+nms: false
+lr0: 0.01
+lrf: 0.01
+momentum: 0.937
+weight_decay: 0.0005
+warmup_epochs: 3.0
+warmup_momentum: 0.8
+warmup_bias_lr: 0.1
+box: 7.5
+cls: 0.5
+dfl: 1.5
+pose: 12.0
+kobj: 1.0
+nbs: 64
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+degrees: 0.0
+translate: 0.1
+scale: 0.5
+shear: 0.0
+perspective: 0.0
+flipud: 0.0
+fliplr: 0.5
+bgr: 0.0
+mosaic: 1.0
+mixup: 0.0
+cutmix: 0.0
+copy_paste: 0.0
+copy_paste_mode: flip
+auto_augment: randaugment
+erasing: 0.4
+cfg: null
+tracker: botsort.yaml
+save_dir: runs\detect\tel_nano
+
+================================================================================
+FILE: 沒用的檔案\aim.py
+================================================================================
+# -*- coding: utf-8 -*-
+"""
+aim.py
+- Aimer（保持不動）
+- 追加 AimWindow（PyQt5 GUI），預設 BAUD=115200、預選 COM18
+  * 套用：各送一行 '1,<x>'、'2,<y>'
+  * 新增「Arduino 輸出」視窗區塊：持續讀取序列埠並顯示回傳訊息
+"""
+from __future__ import annotations
+from typing import Optional, Tuple, TYPE_CHECKING
+import time
+
+try:
+    import serial as pyserial
+except Exception:
+    pyserial = None  # type: ignore
+
+if TYPE_CHECKING:
+    from serial import Serial as SerialT
+else:
+    class SerialT: pass
+
+def _clamp(x, a, b): return a if x < a else b if x > b else x
+
+
+class Aimer:
+    def __init__(self, port="COM18", baud=115200, send_interval_ms=80, verbose=True,
+                 x_min_deg=-30.0, x_max_deg=+30.0, y_min_deg=+10.0, y_max_deg=+80.0,
+                 x_sens_deg_s=60.0, y_sens_deg_s=60.0):
+        self.port, self.baud, self.verbose = port, baud, verbose
+        self._ser: Optional[SerialT] = None
+        self._interval = send_interval_ms / 1000.0
+        self._last_send = 0.0
+        self._x_rng = (float(x_min_deg), float(x_max_deg))
+        self._y_rng = (float(y_min_deg), float(y_max_deg))
+        self._x = (x_min_deg + x_max_deg) / 2.0
+        self._y = (y_min_deg + y_max_deg) / 2.0
+        self._last_xy: Tuple[float, float] = (9999, 9999)
+        self._sx = float(x_sens_deg_s)
+        self._sy = float(y_sens_deg_s)
+        self._connect()
+
+    def _connect(self):
+        if pyserial is None:
+            if self.verbose: print("[AIM] pyserial 未安裝，dryrun")
+            return
+        try:
+            self._ser = pyserial.Serial(self.port, self.baud, timeout=0.02)
+            if self.verbose: print(f"[AIM] OPEN {self.port} @ {self.baud}")
+            time.sleep(1.2)
+        except Exception as e:
+            self._ser = None
+            if self.verbose: print(f"[AIM] 開啟失敗：{e}（dryrun）")
+
+    def _send_line(self, s: str):
+        if not s.endswith("\n"): s += "\n"
+        if self._ser:
+            try: self._ser.write(s.encode("utf-8"))
+            except Exception as e:
+                if self.verbose: print(f"[AIM] 寫入失敗：{e}")
         else:
-            lx = ly = rx = ry = rot_l = rot_r = 0.0
+            if self.verbose: print(f"[AIM] (drysend) {s.strip()}")
 
-        if on_axis:
-            try: on_axis(lx, ly, rx, ry, rot_l, rot_r)
-            except Exception as e: print(f"[xboxGUI] on_axis error: {e}")
-        if on_btn:
-            try: on_btn(a, b, x, y, lb, rb)
-            except Exception as e: print(f"[xboxGUI] on_buttons error: {e}")
+    def nudge_from_stick(self, rx: float, ry: float, dt: float):
+        if dt <= 0: return
+        dx = float(rx) * self._sx * dt
+        dy = float(-ry) * self._sy * dt
+        self._x = _clamp(self._x + dx, *self._x_rng)
+        self._y = _clamp(self._y + dy, *self._y_rng)
+        self._maybe_send()
 
-        clock.tick(fps)
+    def _maybe_send(self):
+        now = time.time()
+        if now - self._last_send < self._interval: return
+        cur = (round(self._x, 3), round(self._y, 3))
+        if cur == self._last_xy: return
+        self._last_send = now; self._last_xy = cur
+        self._send_line(f"1,{cur[0]:.3f}")
+        self._send_line(f"2,{cur[1]:.3f}")
+
+    def home_center(self):
+        self._x = sum(self._x_rng) * 0.5
+        self._y = sum(self._y_rng) * 0.5
+        self._maybe_send()
+
+    def set_xy_deg(self, x_deg: float, y_deg: float):
+        self._x = _clamp(float(x_deg), *self._x_rng)
+        self._y = _clamp(float(y_deg), *self._y_rng)
+        self._maybe_send()
+
+    def close(self):
+        if self._ser:
+            try: self._ser.close()
+            finally: self._ser = None
+            if self.verbose: print("[AIM] CLOSED")
+
+
+# =======================
+# 追加：AimWindow（含 Arduino 輸出顯示）
+# =======================
+try:
+    from PyQt5.QtCore import QTimer
+    from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QPushButton, QGroupBox, QComboBox, QTextEdit
+    import serial
+    import serial.tools.list_ports as list_ports
+
+    class AimWindow(QWidget):
+        BAUD = 115200
+        DEFAULT_PORT = "COM18"
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Aim 視窗（未連線）")
+            self.resize(520, 320)
+
+            # 連線列
+            self.port_combo = QComboBox(); self._refresh_ports(); self._preselect_port(self.DEFAULT_PORT)
+            btn_refresh = QPushButton("刷新"); btn_refresh.clicked.connect(self._refresh_ports)
+            self.btn_conn = QPushButton("連線"); self.btn_disc = QPushButton("斷線")
+            self.btn_conn.clicked.connect(self._connect); self.btn_disc.clicked.connect(self._disconnect)
+            self.btn_disc.setEnabled(False)
+            top = QHBoxLayout(); top.addWidget(QLabel("COM：")); top.addWidget(self.port_combo, 1)
+            top.addWidget(btn_refresh); top.addWidget(self.btn_conn); top.addWidget(self.btn_disc)
+
+            # 角度
+            self.x_spin = QSpinBox(); self.x_spin.setRange(-180, 180); self.x_spin.setSingleStep(1)
+            self.y_spin = QSpinBox(); self.y_spin.setRange(-180, 180); self.y_spin.setSingleStep(1)
+            grp = QGroupBox("角度 (°)")
+            gl = QHBoxLayout(grp); gl.addWidget(QLabel("X：")); gl.addWidget(self.x_spin); gl.addSpacing(12)
+            gl.addWidget(QLabel("Y：")); gl.addWidget(self.y_spin); gl.addStretch(1)
+
+            self.btn_apply = QPushButton("套用"); self.btn_zero = QPushButton("歸零")
+            self.btn_apply.clicked.connect(self.on_apply); self.btn_zero.clicked.connect(self.on_zero)
+            row = QHBoxLayout(); row.addWidget(self.btn_apply); row.addWidget(self.btn_zero); row.addStretch(1)
+
+            # 底部：Arduino 輸出
+            out_grp = QGroupBox("Arduino 輸出")
+            vg = QVBoxLayout(out_grp)
+            self.out_view = QTextEdit(); self.out_view.setReadOnly(True)
+            vg.addWidget(self.out_view)
+
+            root = QVBoxLayout(self); root.addLayout(top); root.addWidget(grp); root.addLayout(row); root.addWidget(out_grp, 1)
+
+            self._ser = None; self._cur_port = ""; self._rxbuf = b""
+            self._rx_timer = QTimer(self); self._rx_timer.timeout.connect(self._poll_rx); self._rx_timer.start(50)
+
+        # connect
+        def _refresh_ports(self):
+            self.port_combo.clear()
+            try:
+                for p in list_ports.comports():
+                    self.port_combo.addItem(p.device)
+            except Exception:
+                pass
+
+        def _preselect_port(self, name: str):
+            idx = self.port_combo.findText(name)
+            if idx >= 0: self.port_combo.setCurrentIndex(idx)
+
+        def _connect(self):
+            if self._ser: return
+            port = self.port_combo.currentText().strip()
+            if not port: return
+            try:
+                self._ser = serial.Serial(port=port, baudrate=self.BAUD, timeout=0.0)  # 非阻塞
+                self._cur_port = port
+                self.btn_conn.setEnabled(False); self.btn_disc.setEnabled(True)
+                self._log(f"[Connected] {port} @ {self.BAUD}")
+                self.setWindowTitle(f"Aim 視窗（{port}）")
+            except Exception as e:
+                self._log(f"[連線失敗] {e}")
+
+        def _disconnect(self):
+            if self._ser:
+                try: self._ser.close()
+                except Exception: pass
+            self._ser = None; self._cur_port = ""; self._rxbuf = b""
+            self.btn_conn.setEnabled(True); self.btn_disc.setEnabled(False)
+            self._log("[Disconnected]")
+            self.setWindowTitle("Aim 視窗（未連線）")
+
+        # io
+        def _write_line(self, s: str):
+            if not self._ser: self._log("尚未連線 Arduino"); return
+            try:
+                self._ser.write((s+"\n").encode("utf-8")); self._log(f">> {s}")
+            except Exception as e:
+                self._log(f"[TX 失敗] {e}")
+
+        def _poll_rx(self):
+            if not self._ser: return
+            try:
+                n = self._ser.in_waiting
+                if n:
+                    data = self._ser.read(n)
+                    self._rxbuf += data
+                    while b"\n" in self._rxbuf:
+                        line, self._rxbuf = self._rxbuf.split(b"\n", 1)
+                        text = line.decode("utf-8", "ignore").rstrip("\r")
+                        self._log(text)
+            except Exception:
+                pass
+
+        def _log(self, s: str):
+            self.out_view.append(s)
+
+        # actions
+        def on_apply(self):
+            x = int(self.x_spin.value()); y = int(self.y_spin.value())
+            self._write_line(f"1,{x}"); self._write_line(f"2,{y}")
+            if self._cur_port:
+                self.setWindowTitle(f"Aim 視窗（{self._cur_port}）  X={x}  Y={y}")
+
+        def on_zero(self):
+            self.x_spin.setValue(0); self.y_spin.setValue(0); self.on_apply()
+
+        def closeEvent(self, e):
+            try:
+                if self._ser: self._ser.close()
+            except Exception: pass
+            super().closeEvent(e)
+except Exception:
+    pass
 
 ================================================================================
-FILE: XboxGUI_V1.ui
+FILE: 沒用的檔案\main.py
+================================================================================
+# -*- coding: utf-8 -*-
+import sys
+from PyQt5.QtWidgets import QApplication
+
+from mega1_controller import ControllerWindow
+from aim import AimWindow
+from xboxGUI import XboxWindow
+from system_status_gui import SystemStatusWindow
+
+def main():
+    app = QApplication(sys.argv)
+
+    syswin = SystemStatusWindow()
+    ctrl   = ControllerWindow()
+    aim    = AimWindow()
+    xbox   = XboxWindow()
+
+    # 把 Controller 的狀態與訊息同步到 SystemStatus
+    try:
+        ctrl.arduino_conn_changed.connect(syswin.update_arduino_status)
+        ctrl.message.connect(syswin.append_log)
+    except Exception:
+        pass
+
+    # 一次顯示所有視窗
+    syswin.show()
+    ctrl.show()
+    aim.show()
+    xbox.show()
+
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+FILE: 沒用的檔案\mega1_controller.py
+================================================================================
+# -*- coding: utf-8 -*-
+"""
+mega1_controller.py
+- MegaController（維持不動）
+- 追加 ControllerWindow（PyQt5 GUI）
+  * 預設 BAUD=115200、預選 COM19
+  * 送指令：數字（NEO），F/R/S（步進；S=後退）
+  * 新增「Arduino 輸出」視窗區塊：持續讀取序列埠並顯示回傳訊息
+"""
+from __future__ import annotations
+import threading, time
+from typing import Optional, TYPE_CHECKING
+
+try:
+    import serial as pyserial
+except Exception:
+    pyserial = None  # type: ignore
+
+if TYPE_CHECKING:
+    from serial import Serial as SerialT
+else:
+    class SerialT: pass
+
+
+class MegaController:
+    MODE_CHASSIS = "CHASSIS"
+    MODE_SHOOTER = "SHOOTER"
+
+    def __init__(self, port="COM19", baud=115200, send_interval_s=0.08, verbose=True):
+        self.port, self.baud, self.verbose = port, baud, verbose
+        self._ser: Optional[SerialT] = None
+        self._vx = 0.0; self._vy = 0.0; self._wz = 0.0
+        self._interval = max(0.01, float(send_interval_s))
+        self._mode = self.MODE_CHASSIS
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._connect()
+        self._start_tx_loop()
+
+    def _connect(self):
+        if pyserial is None:
+            if self.verbose: print("[Mega] pyserial 未安裝，dryrun")
+            return
+        try:
+            self._ser = pyserial.Serial(self.port, self.baud, timeout=0.0, write_timeout=0.0)
+            if self.verbose: print(f"[Mega] OPEN {self.port} @ {self.baud}")
+            time.sleep(1.5)
+            self._send_line(f"MODE {self._mode}")
+        except Exception as e:
+            self._ser = None
+            if self.verbose: print(f"[Mega] 開啟失敗：{e}（dryrun）")
+
+    def _close(self):
+        if self._ser:
+            try: self._ser.close()
+            finally: self._ser = None
+            if self.verbose: print("[Mega] CLOSED")
+
+    def _send_line(self, s: str):
+        if not s.endswith("\n"): s += "\n"
+        if self._ser:
+            try: self._ser.write(s.encode("ascii"))
+            except Exception as e:
+                if self.verbose: print(f"[Mega] 寫入失敗：{e}")
+        else:
+            if self.verbose: print(f"[Mega] (drysend) {s.strip()}")
+
+    def _start_tx_loop(self):
+        def loop():
+            next_t = 0.0
+            while not self._stop.is_set():
+                now = time.monotonic()
+                if now >= next_t:
+                    with self._lock:
+                        mode, vx, vy, wz = self._mode, self._vx, self._vy, self._wz
+                    if mode == self.MODE_CHASSIS:
+                        self._send_line(f"{vx:.2f},{vy:.2f},{wz:.2f}")
+                    next_t = now + self._interval
+                time.sleep(0.002)
+        threading.Thread(target=loop, daemon=True).start()
+
+    # ---- 公開 API ----
+    def move_forward(self, percent: int):
+        p = max(-100, min(100, int(percent)))
+        with self._lock: self._vx = p / 100.0
+        if abs(p) > 0: self.set_mode(self.MODE_CHASSIS)
+
+    def move_XY(self, percent: int):
+        p = max(-100, min(100, int(percent)))
+        with self._lock: self._vy = p / 100.0
+        if abs(p) > 0: self.set_mode(self.MODE_CHASSIS)
+    move_xy = move_XY
+
+    def rotate(self, percent: int):
+        p = max(-100, min(100, int(percent)))
+        with self._lock: self._wz = p / 100.0
+        if abs(p) > 0: self.set_mode(self.MODE_CHASSIS)
+
+    # 射手端
+    def feed(self):    self.set_mode(self.MODE_SHOOTER); self._send_line("R")
+    def reverse(self): self.set_mode(self.MODE_SHOOTER); self._send_line("F")
+    def set_neo(self, speed: int):
+        v = int(max(-100, min(100, speed)))
+        self.set_mode(self.MODE_SHOOTER); self._send_line(str(v))
+
+    def set_mode(self, mode: str):
+        if mode not in (self.MODE_CHASSIS, self.MODE_SHOOTER): return
+        with self._lock:
+            if mode == self._mode: return
+            self._mode = mode
+        self._send_line(f"MODE {mode}")
+        time.sleep(0.2)
+
+    def close(self):
+        self._stop.set(); time.sleep(0.05); self._close()
+
+
+# ============================
+# 追加：Controller 視窗 GUI（含 Arduino 輸出顯示）
+# ============================
+try:
+    from PyQt5.QtCore import QTimer, pyqtSignal
+    from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox, QLineEdit, QGroupBox, QTextEdit
+    import serial
+    import serial.tools.list_ports as list_ports
+
+    class ControllerWindow(QWidget):
+        """
+        Arduino 控制視窗
+        - 預設 BAUD=115200、預選 COM19
+        - 指令：數字（NEO）、F/R/S（步進；S=後退）
+        - 下方文字框顯示 Arduino 回傳（非阻塞輪詢）
+        """
+        BAUD = 115200
+        DEFAULT_PORT = "COM19"
+
+        arduino_conn_changed = pyqtSignal(bool, str)
+        message = pyqtSignal(str)
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Arduino 控制")
+            self.resize(520, 360)
+
+            # 連線列
+            self.port_combo = QComboBox(); self._refresh_ports(); self._preselect_port(self.DEFAULT_PORT)
+            btn_refresh = QPushButton("刷新"); btn_refresh.clicked.connect(self._refresh_ports)
+            self.btn_conn = QPushButton("連線"); self.btn_disc = QPushButton("斷線")
+            self.btn_conn.clicked.connect(self._connect); self.btn_disc.clicked.connect(self._disconnect)
+            self.btn_disc.setEnabled(False)
+
+            top = QHBoxLayout()
+            top.addWidget(QLabel("COM：")); top.addWidget(self.port_combo, 1)
+            top.addWidget(btn_refresh); top.addWidget(self.btn_conn); top.addWidget(self.btn_disc)
+
+            # 指令列
+            self.inp = QLineEdit(); self.inp.setPlaceholderText("輸入數字→Enter 直接送給 Arduino（NEO）")
+            self.inp.returnPressed.connect(self._send_text)
+            bF = QPushButton("F"); bR = QPushButton("R"); bS = QPushButton("S")
+            bF.clicked.connect(lambda: self._send_literal("F"))
+            bR.clicked.connect(lambda: self._send_literal("R"))
+            bS.clicked.connect(lambda: self._send_literal("S"))
+            grp = QGroupBox("指令")
+            g = QVBoxLayout(grp)
+            g.addWidget(self.inp)
+            row = QHBoxLayout(); row.addWidget(bF); row.addWidget(bR); row.addWidget(bS)
+            g.addLayout(row)
+
+            # 底部：Arduino 輸出
+            out_grp = QGroupBox("Arduino 輸出")
+            vg = QVBoxLayout(out_grp)
+            self.out_view = QTextEdit(); self.out_view.setReadOnly(True)
+            vg.addWidget(self.out_view)
+
+            root = QVBoxLayout(self)
+            root.addLayout(top)
+            root.addWidget(grp)
+            root.addWidget(out_grp, 1)
+
+            self._ser = None; self._cur_port = ""; self._rxbuf = b""
+
+            # 非阻塞輪詢 RX
+            self._rx_timer = QTimer(self); self._rx_timer.timeout.connect(self._poll_rx); self._rx_timer.start(50)
+
+        # --- 連線 ---
+        def _refresh_ports(self):
+            self.port_combo.clear()
+            try:
+                for p in list_ports.comports():
+                    self.port_combo.addItem(p.device)
+            except Exception:
+                pass
+
+        def _preselect_port(self, name: str):
+            idx = self.port_combo.findText(name)
+            if idx >= 0: self.port_combo.setCurrentIndex(idx)
+
+        def _connect(self):
+            if self._ser: return
+            port = self.port_combo.currentText().strip()
+            if not port: return
+            try:
+                self._ser = serial.Serial(port=port, baudrate=self.BAUD, timeout=0.0)  # 非阻塞
+                self._cur_port = port
+                self.btn_conn.setEnabled(False); self.btn_disc.setEnabled(True)
+                self.arduino_conn_changed.emit(True, port)
+                self._log(f"[Connected] {port} @ {self.BAUD}")
+                self.setWindowTitle(f"Arduino 控制（{port}）")
+            except Exception as e:
+                self._log(f"[連線失敗] {e}")
+
+        def _disconnect(self):
+            if self._ser:
+                try: self._ser.close()
+                except Exception: pass
+            port = self._cur_port
+            self._ser = None; self._cur_port = ""; self._rxbuf = b""
+            self.btn_conn.setEnabled(True); self.btn_disc.setEnabled(False)
+            self.arduino_conn_changed.emit(False, port)
+            self._log(f"[Disconnected] {('from '+port) if port else ''}")
+            self.setWindowTitle("Arduino 控制（未連線）")
+
+        # --- TX/RX ---
+        def _write_line(self, s: str):
+            if not self._ser:
+                self._log("尚未連線 Arduino"); return
+            try:
+                self._ser.write((s+"\n").encode("utf-8"))
+                self._log(f">> {s}")
+            except Exception as e:
+                self._log(f"[TX 失敗] {e}")
+
+        def _send_text(self):
+            s = self.inp.text().strip()
+            if not s: return
+            self._write_line(s); self.inp.clear()
+
+        def _send_literal(self, token: str):
+            self._write_line(token)
+
+        def _poll_rx(self):
+            if not self._ser: return
+            try:
+                n = self._ser.in_waiting
+                if n:
+                    data = self._ser.read(n)
+                    self._rxbuf += data
+                    while b"\n" in self._rxbuf:
+                        line, self._rxbuf = self._rxbuf.split(b"\n", 1)
+                        text = line.decode("utf-8", "ignore").rstrip("\r")
+                        self._log(text)
+            except Exception:
+                pass
+
+        def _log(self, s: str):
+            self.out_view.append(s)
+            self.message.emit(s)
+
+        def closeEvent(self, e):
+            try:
+                if self._ser: self._ser.close()
+            except Exception: pass
+            super().closeEvent(e)
+except Exception:
+    pass
+
+================================================================================
+FILE: 沒用的檔案\system_status_gui.py
+================================================================================
+# -*- coding: utf-8 -*-
+from PyQt5.QtCore import QTimer, pyqtSlot
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QGroupBox, QTextEdit
+
+try:
+    import psutil
+except Exception:
+    psutil = None
+try:
+    import serial.tools.list_ports as list_ports
+except Exception:
+    list_ports = None
+
+
+class SystemStatusWindow(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("System Status / Arduino 狀態")
+        self.resize(520, 440)
+
+        self.cpu_label = QLabel("CPU：- %")
+        self.mem_label = QLabel("RAM：- %")
+        self.ard_label = QLabel("Arduino：未連線")
+        self.ard_label.setStyleSheet("color:#dc2626; font-weight:bold;")
+
+        # 系統
+        sys_box = QGroupBox("系統資源")
+        v = QVBoxLayout(sys_box); v.addWidget(self.cpu_label); v.addWidget(self.mem_label)
+
+        # COM
+        com_box = QGroupBox("可用序列埠 (COM)")
+        v2 = QVBoxLayout(com_box); self.com_list = QListWidget(); v2.addWidget(self.com_list)
+
+        # Arduino
+        ard_box = QGroupBox("Arduino 狀態")
+        v3 = QVBoxLayout(ard_box); v3.addWidget(self.ard_label)
+
+        # Log
+        log_box = QGroupBox("系統訊息")
+        v4 = QVBoxLayout(log_box); self.log = QTextEdit(); self.log.setReadOnly(True); v4.addWidget(self.log)
+
+        root = QVBoxLayout(self)
+        top = QHBoxLayout()
+        left = QVBoxLayout(); left.addWidget(sys_box); left.addWidget(ard_box)
+        top.addLayout(left, 1); top.addWidget(com_box, 1)
+        root.addLayout(top, 2); root.addWidget(log_box, 1)
+
+        self.t_sys = QTimer(self); self.t_sys.timeout.connect(self._refresh_system); self.t_sys.start(1000)
+        self.t_com = QTimer(self); self.t_com.timeout.connect(self._refresh_coms);  self.t_com.start(2000)
+        self._refresh_system(); self._refresh_coms()
+
+    def append_log(self, s: str): self.log.append(s)
+
+    @pyqtSlot(bool, str)
+    def update_arduino_status(self, connected: bool, port: str):
+        if connected:
+            self.ard_label.setText(f"Arduino：已連線（{port}）")
+            self.ard_label.setStyleSheet("color:#16a34a; font-weight:bold;")
+            self.append_log(f"[Arduino] Connected on {port}")
+        else:
+            self.ard_label.setText("Arduino：未連線")
+            self.ard_label.setStyleSheet("color:#dc2626; font-weight:bold;")
+            self.append_log(f"[Arduino] Disconnected{(' from '+port) if port else ''}")
+
+    def _refresh_system(self):
+        if not psutil:
+            self.cpu_label.setText("CPU：psutil 未安裝"); self.mem_label.setText("RAM：psutil 未安裝"); return
+        self.cpu_label.setText(f"CPU：{psutil.cpu_percent():.1f} %")
+        self.mem_label.setText(f"RAM：{psutil.virtual_memory().percent:.1f} %")
+
+    def _refresh_coms(self):
+        self.com_list.clear()
+        if not list_ports:
+            self.com_list.addItem("pyserial 未安裝"); return
+        for p in list_ports.comports():
+            self.com_list.addItem(f"{p.device} | {p.description}")
+
+================================================================================
+FILE: 沒用的檔案\xboxGUI.py
+================================================================================
+# === 追加：可相容 Qt6 .ui 的 Xbox 視窗（載入失敗時不影響原本 run()） ===
+import os, io, re
+try:
+    from PyQt5 import uic
+    from PyQt5.QtCore import QTimer, pyqtSignal
+    from PyQt5.QtWidgets import QWidget
+    import pygame as _pg
+
+    def _fix_qt6_enums(ui_text: str) -> str:
+        rep = {
+            "Qt::Orientation::Horizontal": "Qt::Horizontal",
+            "Qt::Orientation::Vertical": "Qt::Vertical",
+            "Qt::AlignmentFlag::AlignLeft": "Qt::AlignLeft",
+            "Qt::AlignmentFlag::AlignRight": "Qt::AlignRight",
+            "Qt::AlignmentFlag::AlignHCenter": "Qt::AlignHCenter",
+            "Qt::AlignmentFlag::AlignVCenter": "Qt::AlignVCenter",
+            "Qt::AlignmentFlag::AlignCenter": "Qt::AlignCenter",
+            "Qt::CheckState::Unchecked": "Qt::Unchecked",
+            "Qt::CheckState::PartiallyChecked": "Qt::PartiallyChecked",
+            "Qt::CheckState::Checked": "Qt::Checked",
+        }
+        for k, v in rep.items():
+            ui_text = ui_text.replace(k, v)
+        ui_text = re.sub(r'(Qt|QSizePolicy|QFrame|QAbstractItemView|QTabWidget|QToolButton|QDialogButtonBox)::[A-Za-z_]+::',
+                         r'\1::', ui_text)
+        return ui_text
+
+    class XboxWindow(QWidget):
+        axisChanged = pyqtSignal(float, float, float, float, float, float)
+        buttonsChanged = pyqtSignal(bool, bool, bool, bool, bool, bool)
+
+        def __init__(self, parent=None, deadzone=0.15):
+            super().__init__(parent)
+            self._dz = float(deadzone)
+            self._status_lbl = None
+
+            # 優先載入 XboxGUI_V2.ui；若失敗→顯示簡易空殼視窗（不影響功能）
+            try:
+                ui_path = os.path.join(os.path.dirname(__file__), "XboxGUI_V2.ui")
+                with open(ui_path, "r", encoding="utf-8") as f:
+                    patched = _fix_qt6_enums(f.read())
+                uic.loadUi(io.StringIO(patched), self)
+                for name in ("labelStatus","statusLabel","infoLabel","lblStatus"):
+                    w = getattr(self, name, None)
+                    if w is not None:
+                        self._status_lbl = w
+                        break
+            except Exception as e:
+                from PyQt5.QtWidgets import QVBoxLayout, QLabel
+                self.setWindowTitle("Xbox 視窗")
+                lay = QVBoxLayout(self)
+                self._status_lbl = QLabel(f"(未載入 .ui：{e})", self)
+                lay.addWidget(self._status_lbl)
+
+            self.setWindowTitle("Xbox 視窗")
+            _pg.init(); _pg.joystick.init()
+            self._js = None
+            if _pg.joystick.get_count() > 0:
+                self._js = _pg.joystick.Joystick(0); self._js.init()
+                self._set_status("已偵測到搖桿 0 號")
+            else:
+                self._set_status("找不到搖桿（請插上手把）")
+
+            self._timer = QTimer(self)
+            self._timer.timeout.connect(self._tick)
+            self._timer.start(100)
+
+        def _set_status(self, text: str):
+            if self._status_lbl is not None: self._status_lbl.setText(text)
+            else: self.setWindowTitle(f"Xbox 視窗 - {text}")
+
+        def _dead(self, x): 
+            x=float(x); return 0.0 if abs(x) < 0.15 else x
+
+        def _tick(self):
+            for _ in _pg.event.get(): pass
+            if not self._js:
+                self._set_status("找不到搖桿"); return
+
+            lx = self._dead(self._js.get_axis(0))
+            ly = self._dead(self._js.get_axis(1))
+            rx = self._dead(self._js.get_axis(2))
+            ry = self._dead(self._js.get_axis(3))
+            lt = float(self._js.get_axis(4))
+            rt = float(self._js.get_axis(5))
+
+            a = bool(self._js.get_button(0)); b = bool(self._js.get_button(1))
+            x = bool(self._js.get_button(2)); y = bool(self._js.get_button(3))
+            lb = bool(self._js.get_button(4)); rb = bool(self._js.get_button(5))
+
+            self.axisChanged.emit(lx, ly, rx, ry, lt, rt)
+            self.buttonsChanged.emit(a, b, x, y, lb, rb)
+            self._set_status(f"L({lx:+.2f},{ly:+.2f}) R({rx:+.2f},{ry:+.2f}) LT:{lt:+.2f} RT:{rt:+.2f} "
+                             f"A{int(a)} B{int(b)} X{int(x)} Y{int(y)} LB{int(lb)} RB{int(rb)}")
+except Exception:
+    # 沒有 PyQt5 時，只保留原本的 pygame 版本 run()，完全不受影響
+    pass
+
+================================================================================
+FILE: 沒用的檔案\XboxGUI_V1.ui
 ================================================================================
 <?xml version="1.0" encoding="UTF-8"?>
 <ui version="4.0">
@@ -949,7 +3564,7 @@ FILE: XboxGUI_V1.ui
 </ui>
 
 ================================================================================
-FILE: XboxGUI_V2.ui
+FILE: 沒用的檔案\XboxGUI_V2.ui
 ================================================================================
 <?xml version="1.0" encoding="UTF-8"?>
 <ui version="4.0">
@@ -1516,446 +4131,3 @@ QPushButton:pressed {
  <resources/>
  <connections/>
 </ui>
-
-================================================================================
-FILE: aim\aim.ino
-================================================================================
-/*******************************************************
- * Arduino：雙軸步進（只支援 1,角度 / 2,角度）
- * M1: 42667 步/圈
- * M2: 57600 步/圈
- * 範例：1,45.0   或   2,90
- *******************************************************/
-#include <Arduino.h>
-
-struct StepperAxis {
-  int PUL, DIR, ENA;
-  bool DIR_INVERT;        // true=反向（若方向顛倒，改這個）
-  bool ENA_ACTIVE_HIGH;   // true=HIGH為使能
-  float currentAngle;     // 目前角度(度)
-  long stepsPerRev;       // 每圈步數(含細分/減速)
-  int speed_us;           // 半脈衝延遲(μs)，越小越快
-};
-
-// === 腳位（依你前兩份程式） ===
-const int M1_PUL = 13, M1_DIR = 12, M1_ENA = 11;  // 軸1
-const int M2_PUL = 10, M2_DIR = 9,  M2_ENA = 8;   // 軸2
-
-// === 每圈步數（已依你提供設定） ===
-const long M1_STEPS_PER_REV = 42667L;
-const long M2_STEPS_PER_REV = 57600L;
-
-// === 參數 ===
-StepperAxis m1 = { M1_PUL, M1_DIR, M1_ENA, true,  true, 0.0, M1_STEPS_PER_REV, 25 };
-StepperAxis m2 = { M2_PUL, M2_DIR, M2_ENA, true,  true, 0.0, M2_STEPS_PER_REV, 25 };
-
-static inline void holdEnable(const StepperAxis& ax, bool on) {
-  digitalWrite(ax.ENA, on ? (ax.ENA_ACTIVE_HIGH ? HIGH : LOW)
-                          : (ax.ENA_ACTIVE_HIGH ? LOW  : HIGH));
-}
-
-void setupAxis(const StepperAxis& ax) {
-  pinMode(ax.PUL, OUTPUT);
-  pinMode(ax.DIR, OUTPUT);
-  pinMode(ax.ENA, OUTPUT);
-  holdEnable(ax, true); // 使能保持鎖住
-}
-
-void setup() {
-  Serial.begin(115200);
-  setupAxis(m1);
-  setupAxis(m2);
-  Serial.println(F("就緒：只接受 1,角度 或 2,角度"));
-  Serial.println(F("M1=42667 步/圈, M2=57600 步/圈"));
-}
-
-void loop() {
-  if (!Serial.available()) return;
-  String cmd = Serial.readStringUntil('\n');
-  cmd.trim();
-  if (!cmd.length()) return;
-
-  int comma = cmd.indexOf(',');
-  if (comma <= 0) {
-    Serial.println(F("❌ 格式錯誤：請輸入 1,角度 或 2,角度"));
-    return;
-  }
-
-  int axisId = cmd.substring(0, comma).toInt();
-  float targetAngle = cmd.substring(comma + 1).toFloat();
-
-  if (axisId == 1) {
-    moveToAngle(m1, targetAngle);
-    Serial.println(F("M1 OK"));
-  } else if (axisId == 2) {
-    moveToAngle(m2, targetAngle);
-    Serial.println(F("M2 OK"));
-  } else {
-    Serial.println(F("❌ 馬達編號只接受 1 或 2"));
-  }
-}
-
-void moveToAngle(StepperAxis& ax, float targetAngle) {
-  float diff = targetAngle - ax.currentAngle;
-  // 自行四捨五入以避免 lround 帶來的額外體積
-  long stepsToMove = (long)(fabs(diff) * ((double)ax.stepsPerRev / 360.0) + 0.5);
-  if (stepsToMove <= 0) { ax.currentAngle = targetAngle; return; }
-
-  bool dirLogical = (diff >= 0);
-  if (ax.DIR_INVERT) dirLogical = !dirLogical;
-  digitalWrite(ax.DIR, dirLogical ? HIGH : LOW);
-
-  holdEnable(ax, true); // 確保保持
-
-  for (long i = 0; i < stepsToMove; i++) {
-    digitalWrite(ax.PUL, HIGH);
-    delayMicroseconds(ax.speed_us);
-    digitalWrite(ax.PUL, LOW);
-    delayMicroseconds(ax.speed_us);
-  }
-  ax.currentAngle = targetAngle;
-}
-
-================================================================================
-FILE: chassis_shooter\chassis_shooter.ino
-================================================================================
-// Mega_Mux_NoToken.ino
-// 單一韌體，板上分流兩種模式以降低負荷：
-//   模式 CHASSIS：只跑麥輪底盤（vx,vy,wz）
-//   模式 SHOOTER：只跑 NEO + 步進（整數 -100..100, F/R/S）
-//
-// 串列指令 (無 TOKEN；相容舊有 <11323310> 前綴會自動剝除) ：
-//   MODE CHASSIS          切換到底盤模式（並關閉發射模組）
-//   MODE SHOOTER          切換到發射模式（並關閉底盤）
-//   STATUS                顯示目前模式與該模式的狀態
-//   STOP                  依模式停當前子系統：CHASSIS 停車；SHOOTER 停步進+NEO=0
-//   vx,vy,wz              僅 CHASSIS 模式有效 (範圍建議 -1..1)
-//   F / R / S             僅 SHOOTER 模式有效（步進 前/反/停(抱死)）
-//   -100..100             僅 SHOOTER 模式有效（NEO 速度）
-//
-// 降負荷重點：
-//  - 僅在 CHASSIS 模式執行 rampUpdateAndApply() 與底盤 telemetry
-//  - 僅在 SHOOTER 模式執行 serviceStepper()（步進脈衝）與 NEO Servo（attach）
-//  - 切到 CHASSIS 會 detach Servo（釋放計時器中斷），步進 ENA=HIGH（抱死、停脈衝）
-//  - 切到 SHOOTER 會 stopAll() 關閉所有底盤 PWM
-//  - Telemetry 僅輸出當前模式的必要資訊
-
-#include <Arduino.h>
-#include <math.h>
-#include <Servo.h>
-
-// ================== 模式定義 ==================
-enum Mode { MODE_CHASSIS = 0, MODE_SHOOTER = 1 };
-volatile Mode g_mode = MODE_CHASSIS;
-
-// ================== CHASSIS（麥輪） ==================
-// Pins (MEGA)
-const uint8_t M1_PWM_A_PIN = 2;  // 前左 index 0
-const uint8_t M1_PWM_B_PIN = 3;
-const uint8_t M2_PWM_A_PIN = 4;  // 左後 index 1
-const uint8_t M2_PWM_B_PIN = 5;
-const uint8_t M3_PWM_A_PIN = 7;  // 右前 index 2
-const uint8_t M3_PWM_B_PIN = 6;
-const uint8_t M4_PWM_A_PIN = 8;  // 右後 index 3
-const uint8_t M4_PWM_B_PIN = 9;
-
-const int   MIN_PWM   = 80;
-const int   MAX_PWM   = 255;
-const float RAMP_STEP = 6.0;
-const float DEAD_BAND = 0.02;
-const float K_OMEGA   = 0.5;
-
-float currentPWMvals[4] = {0,0,0,0};
-float targetPWMvals[4]  = {0,0,0,0};
-bool  motorActive       = false;
-
-// ================== SHOOTER（NEO + 步進） ==================
-Servo sparkMax;
-const int SPARK_PWM_PIN = 13;     // NEO (Spark MAX) PWM
-bool servoAttached = false;
-int  neoSpeed = 0;                // -100..100（僅作狀態記錄）
-
-const int PUL = 53;
-const int DIR = 52;
-const int ENA = 51;
-const unsigned int PULSE_US = 25;
-
-enum StepState { STEP_STOP=0, STEP_FWD, STEP_REV };
-volatile StepState stepState = STEP_STOP;
-unsigned long lastToggleMicros = 0;
-bool pulseLevel = false;
-
-// ================== 共用 ==================
-String serialBuf = "";
-unsigned long lastTelemetryMs = 0;
-const unsigned long TELE_CHASSIS_MS = 200UL;
-const unsigned long TELE_SHOOTER_MS = 400UL; // 發射端資訊較少，頻率可放慢
-unsigned long lastTeleBudgetMs = 0;
-
-bool equalsIgnoreCase(const String& a, const char* b) {
-  String t=a; t.toUpperCase(); String u=String(b); u.toUpperCase(); return t==u;
-}
-
-// ------------------ CHASSIS 函式 ------------------
-void stopAllChassis() {
-  analogWrite(M1_PWM_A_PIN,0); analogWrite(M1_PWM_B_PIN,0);
-  analogWrite(M2_PWM_A_PIN,0); analogWrite(M2_PWM_B_PIN,0);
-  analogWrite(M3_PWM_A_PIN,0); analogWrite(M3_PWM_B_PIN,0);
-  analogWrite(M4_PWM_A_PIN,0); analogWrite(M4_PWM_B_PIN,0);
-  for (int i=0;i<4;i++){ currentPWMvals[i]=0; targetPWMvals[i]=0; }
-  motorActive=false;
-  Serial.println("🛑 CHASSIS stop");
-}
-
-void applyMotorDirect(int idx, int pwm_abs, bool forward) {
-  switch(idx){
-    case 0: if(forward){ analogWrite(M1_PWM_A_PIN,pwm_abs); analogWrite(M1_PWM_B_PIN,0);} else { analogWrite(M1_PWM_A_PIN,0); analogWrite(M1_PWM_B_PIN,pwm_abs);} break;
-    case 1: if(forward){ analogWrite(M2_PWM_A_PIN,pwm_abs); analogWrite(M2_PWM_B_PIN,0);} else { analogWrite(M2_PWM_A_PIN,0); analogWrite(M2_PWM_B_PIN,pwm_abs);} break;
-    case 2: if(forward){ analogWrite(M3_PWM_A_PIN,pwm_abs); analogWrite(M3_PWM_B_PIN,0);} else { analogWrite(M3_PWM_A_PIN,0); analogWrite(M3_PWM_B_PIN,pwm_abs);} break;
-    case 3: if(forward){ analogWrite(M4_PWM_A_PIN,pwm_abs); analogWrite(M4_PWM_B_PIN,0);} else { analogWrite(M4_PWM_A_PIN,0); analogWrite(M4_PWM_B_PIN,pwm_abs);} break;
-  }
-}
-
-void applyWheelCommand(float w0,float w1,float w2,float w3){
-  float a[4]={w0,w1,w2,w3}; float maxv=0.0001f;
-  // 固定反向（依你的接線）：前左、右前反向
-  a[0]=-a[0]; a[2]=-a[2];
-  for(int i=0;i<4;i++){ if(fabs(a[i])<DEAD_BAND) a[i]=0; if(fabs(a[i])>maxv) maxv=fabs(a[i]); }
-  if(maxv>1.0f) for(int i=0;i<4;i++) a[i]/=maxv;
-  for(int i=0;i<4;i++){
-    float mag=fabs(a[i]);
-    if(mag<DEAD_BAND) targetPWMvals[i]=0;
-    else {
-      float pwm=MIN_PWM+(MAX_PWM-MIN_PWM)*mag;
-      targetPWMvals[i]=(a[i]>=0)?pwm:-pwm;
-    }
-  }
-  motorActive=true;
-}
-
-void rampUpdateAndApply(){
-  if (g_mode != MODE_CHASSIS) return; // 非底盤模式，不做任何 PWM 更新
-  for(int i=0;i<4;i++){
-    float cur=currentPWMvals[i], tgt=targetPWMvals[i];
-    if (fabs(tgt-cur)<=RAMP_STEP) cur=tgt; else cur += (tgt>cur)?RAMP_STEP:-RAMP_STEP;
-    currentPWMvals[i]=cur;
-    if (fabs(cur)<1.0){
-      switch(i){
-        case 0: analogWrite(M1_PWM_A_PIN,0); analogWrite(M1_PWM_B_PIN,0); break;
-        case 1: analogWrite(M2_PWM_A_PIN,0); analogWrite(M2_PWM_B_PIN,0); break;
-        case 2: analogWrite(M3_PWM_A_PIN,0); analogWrite(M3_PWM_B_PIN,0); break;
-        case 3: analogWrite(M4_PWM_A_PIN,0); analogWrite(M4_PWM_B_PIN,0); break;
-      }
-    }else{
-      applyMotorDirect(i,(int)fabs(cur),(cur>0));
-    }
-  }
-}
-
-void mecanum_from_cmd(float vx,float vy,float wz,float out[4]){
-  // 機體朝向補償：等效順時針 +90° → (vx_r,vy_r)=(-vy, vx)
-  float vx_r=-vy, vy_r=vx;
-  float wFL=vx_r - vy_r - K_OMEGA*wz;
-  float wFR=vx_r + vy_r + K_OMEGA*wz;
-  float wRL=vx_r + vy_r - K_OMEGA*wz;
-  float wRR=vx_r - vy_r + K_OMEGA*wz;
-  float m=max(max(fabs(wFL),fabs(wFR)),max(fabs(wRL),fabs(wRR)));
-  if(m>1.0f){ wFL/=m; wFR/=m; wRL/=m; wRR/=m; }
-  out[0]=wFL; out[1]=wFR; out[2]=wRL; out[3]=wRR;
-}
-
-// ------------------ SHOOTER 函式 ------------------
-void ensureServo(bool wantAttach){
-  if (wantAttach && !servoAttached){
-    sparkMax.attach(SPARK_PWM_PIN);
-    servoAttached = true;
-  } else if (!wantAttach && servoAttached){
-    sparkMax.detach();
-    servoAttached = false;
-  }
-}
-
-void setSparkSpeed(int speed){
-  neoSpeed = speed;
-  if (!servoAttached) return; // 非 SHOOTER 模式時不送脈衝
-  int us = map(speed, -100, 100, 1000, 2000);
-  sparkMax.writeMicroseconds(us);
-  Serial.print("NEO="); Serial.print(speed);
-  Serial.print(" pwm(us)="); Serial.println(us);
-}
-
-void startForward(){ digitalWrite(DIR,HIGH); stepState=STEP_FWD; Serial.println("STEP=F"); }
-void startReverse(){ digitalWrite(DIR,LOW);  stepState=STEP_REV; Serial.println("STEP=R"); }
-void stopStepper(){ stepState=STEP_STOP; pulseLevel=false; digitalWrite(PUL,LOW); digitalWrite(ENA,HIGH); Serial.println("STEP=S (hold)"); }
-
-void serviceStepper(){
-  if (g_mode != MODE_SHOOTER) return;           // 非發射模式，不產生脈衝
-  if (stepState == STEP_STOP) return;           // 停止狀態不占用 CPU
-  unsigned long now=micros();
-  if ((unsigned long)(now - lastToggleMicros) >= PULSE_US){
-    pulseLevel=!pulseLevel;
-    digitalWrite(PUL, pulseLevel?HIGH:LOW);
-    lastToggleMicros=now;
-  }
-}
-
-// ------------------ Telemetry ------------------
-void tele_chassis(){
-  Serial.print("TELE-CH: cur[");
-  for(int i=0;i<4;i++){ if(i) Serial.print(","); Serial.print(currentPWMvals[i],1); }
-  Serial.print("] tgt[");
-  for(int i=0;i<4;i++){ if(i) Serial.print(","); Serial.print(targetPWMvals[i],1); }
-  Serial.println("]");
-}
-void tele_shooter(){
-  Serial.print("TELE-SH: NEO="); Serial.print(neoSpeed);
-  Serial.print(" STEP=");
-  Serial.println(stepState==STEP_STOP?"STOP":(stepState==STEP_FWD?"FWD":"REV"));
-}
-
-// ------------------ 模式切換 ------------------
-void enterChassisMode(){
-  // 關閉發射子系統
-  stopStepper();                 // ENA=HIGH 抱死
-  ensureServo(false);            // detach Servo，釋放計時器中斷
-  setSparkSpeed(0);              // 更新邏輯值，實際輸出因已 detach 不會送
-  // 底盤安全歸零
-  stopAllChassis();
-  g_mode = MODE_CHASSIS;
-  lastTelemetryMs = millis();
-  Serial.println(">> MODE=CHASSIS");
-}
-
-void enterShooterMode(){
-  // 關閉底盤輸出
-  stopAllChassis();
-  // 啟動發射子系統
-  ensureServo(true);             // attach Servo
-  digitalWrite(ENA,HIGH);        // 上電預設抱死
-  g_mode = MODE_SHOOTER;
-  lastTelemetryMs = millis();
-  Serial.println(">> MODE=SHOOTER");
-}
-
-// ------------------ 狀態印出 ------------------
-void print_status(){
-  Serial.println("=== STATUS ===");
-  Serial.print("MODE: "); Serial.println(g_mode==MODE_CHASSIS?"CHASSIS":"SHOOTER");
-  if (g_mode==MODE_CHASSIS){
-    Serial.print("motorActive: "); Serial.println(motorActive?"YES":"NO");
-    for (int i=0;i<4;i++){
-      Serial.print("cur[");Serial.print(i);Serial.print("]=");Serial.print(currentPWMvals[i],1);
-      Serial.print(" tgt[");Serial.print(i);Serial.print("]=");Serial.println(targetPWMvals[i],1);
-    }
-  } else {
-    Serial.print("NEO speed: "); Serial.println(neoSpeed);
-    Serial.print("STEP state: "); Serial.println(stepState==STEP_STOP?"STOP":(stepState==STEP_FWD?"FWD":"REV"));
-  }
-  Serial.println("=============");
-}
-
-// ------------------ 指令處理 ------------------
-void process_cmd_vel(String &msg){
-  // 僅 CHASSIS 模式有效
-  if (g_mode != MODE_CHASSIS) { Serial.println("IGNORED: vx,vy,wz (MODE!=CHASSIS)"); return; }
-  char buf[128]; msg.toCharArray(buf,sizeof(buf));
-  char *p=strtok(buf,","); float vx=0,vy=0,wz=0;
-  if(p) vx=atof(p);
-  p=strtok(NULL,","); if(p) vy=atof(p);
-  p=strtok(NULL,","); if(p) wz=atof(p);
-  float out[4]; mecanum_from_cmd(vx,vy,wz,out); applyWheelCommand(out[0],out[1],out[2],out[3]);
-}
-
-void handle_line(String line){
-  line.trim();
-  if (!line.length()) return;
-
-  // 相容舊 TOKEN：若前綴 <11323310>，剝掉
-  const String LEGACY = "<11323310>";
-  if (line.startsWith(LEGACY)) { line = line.substring(LEGACY.length()); line.trim(); }
-
-  // 模式切換
-  if (line.equalsIgnoreCase("MODE CHASSIS")) { enterChassisMode(); return; }
-  if (line.equalsIgnoreCase("MODE SHOOTER")) { enterShooterMode(); return; }
-
-  // 通用
-  if (line.equalsIgnoreCase("STATUS")) { print_status(); return; }
-  if (line.equalsIgnoreCase("STOP")) {
-    if (g_mode==MODE_CHASSIS) stopAllChassis();
-    else { stopStepper(); setSparkSpeed(0); if (servoAttached) sparkMax.writeMicroseconds(1500); }
-    Serial.println("🛑 STOP (current mode)");
-    return;
-  }
-
-  // 依模式解譯
-  if (g_mode==MODE_CHASSIS){
-    // 只處理 vx,vy,wz
-    if (line.indexOf(',')>=0) { process_cmd_vel(line); return; }
-    Serial.println("IGNORED (CHASSIS): not vx,vy,wz");
-    return;
-  } else {
-    // SHOOTER：F/R/S / 整數
-    if (equalsIgnoreCase(line,"F")) { startForward(); return; }
-    if (equalsIgnoreCase(line,"R")) { startReverse(); return; }
-    if (equalsIgnoreCase(line,"S")) { stopStepper();  return; }
-    // 其餘視為 NEO 速度
-    long spd = line.toInt();
-    if (spd>100) spd=100; if (spd<-100) spd=-100;
-    setSparkSpeed((int)spd);
-    return;
-  }
-}
-
-// ================== setup / loop ==================
-void setup(){
-  Serial.begin(115200);
-  delay(200);
-  Serial.println("\n=== MEGA Multiplex (CHASSIS / SHOOTER) NoToken ===");
-
-  // 底盤腳位
-  pinMode(M1_PWM_A_PIN, OUTPUT); pinMode(M1_PWM_B_PIN, OUTPUT);
-  pinMode(M2_PWM_A_PIN, OUTPUT); pinMode(M2_PWM_B_PIN, OUTPUT);
-  pinMode(M3_PWM_A_PIN, OUTPUT); pinMode(M3_PWM_B_PIN, OUTPUT);
-  pinMode(M4_PWM_A_PIN, OUTPUT); pinMode(M4_PWM_B_PIN, OUTPUT);
-
-  // 步進腳位
-  pinMode(PUL,OUTPUT); pinMode(DIR,OUTPUT); pinMode(ENA,OUTPUT);
-  digitalWrite(PUL,LOW); digitalWrite(ENA,HIGH); // 先抱死
-
-  // 初始進 CHASSIS，並確保發射子系統關閉
-  ensureServo(false);
-  enterChassisMode();
-
-  Serial.println("用法：MODE CHASSIS / MODE SHOOTER / STATUS / STOP / vx,vy,wz / F/R/S / -100..100");
-}
-
-void loop(){
-  // 只跑當前模式的服務
-  if (g_mode==MODE_CHASSIS){
-    // 無需處理步進；NEO Servo 已 detach
-  } else {
-    // 發射模式：處理步進脈衝
-    serviceStepper();
-  }
-
-  // 收指令（\n 為一行）
-  while (Serial.available()){
-    char c=(char)Serial.read(); if (c=='\r') continue;
-    if (c=='\n'){ String line=serialBuf; serialBuf=""; handle_line(line); }
-    else {
-      serialBuf += c;
-      if (serialBuf.length()>200) serialBuf=serialBuf.substring(serialBuf.length()-200);
-    }
-  }
-
-  // 僅在 CHASSIS 模式更新 PWM
-  if (g_mode==MODE_CHASSIS) rampUpdateAndApply();
-
-  // Telemetry（各模式各自頻率）
-  unsigned long now = millis();
-  if (g_mode==MODE_CHASSIS){
-    if (now - lastTelemetryMs >= TELE_CHASSIS_MS){ lastTelemetryMs = now; tele_chassis(); }
-  } else {
-    if (now - lastTelemetryMs >= TELE_SHOOTER_MS){ lastTelemetryMs = now; tele_shooter(); }
-  }
-}
