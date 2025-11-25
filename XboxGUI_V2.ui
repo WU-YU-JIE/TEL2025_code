@@ -1,0 +1,565 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>Form</class>
+ <widget class="QWidget" name="Form">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>953</width>
+    <height>560</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Xbox Controller GUI</string>
+  </property>
+  <property name="styleSheet">
+   <string>/* ===== 主背景 ===== */
+QWidget {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #212d7aff, stop:0.5 #000001, stop:1 #000000);
+}
+
+/* ===== 水平滑桿 ===== */
+QSlider::groove:horizontal {
+    border: 1px solid #ffffffff;
+    height: 10px;
+    background: #0a0a0a;
+    border-radius: 5px;
+}
+QSlider::handle:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #16d946, stop:1 #0aa62c);
+    border: 2px solid #ffffffff;
+    width: 18px;
+    margin: -5px 0;
+    border-radius: 9px;
+}
+QSlider::handle:horizontal:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2dc759, stop:1 #16d946);
+    border: 2px solid #16d946;
+}
+
+/* ===== 垂直滑桿 ===== */
+QSlider::groove:vertical {
+    border: 1px solid #ffffffff;
+    width: 10px;
+    background: #0a0a0a;
+    border-radius: 5px;
+}
+QSlider::handle:vertical {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #16d946, stop:1 #0aa62c);
+    border: 2px solid #ffffffff;
+    height: 18px;
+    margin: 0 -5px;
+    border-radius: 9px;
+}
+QSlider::handle:vertical:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2dc759, stop:1 #16d946);
+    border: 2px solid #16d946;
+}
+
+/* ===== 標籤 ===== */
+QLabel {
+    color: #16d946;
+    font-weight: bold;
+    font-size: 11px;
+}
+
+/* ===== LCD 數字顯示 ===== */
+QLCDNumber {
+    background: #0a0a0a;
+    color: #16d946;
+    border: 2px solid #ffffffff;
+    border-radius: 4px;
+    font-weight: bold;
+}</string>
+  </property>
+  <widget class="QSlider" name="Move_X">
+   <property name="geometry">
+    <rect>
+     <x>80</x>
+     <y>420</y>
+     <width>160</width>
+     <height>22</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Orientation::Horizontal</enum>
+   </property>
+  </widget>
+  <widget class="QSlider" name="Move_Y">
+   <property name="geometry">
+    <rect>
+     <x>150</x>
+     <y>350</y>
+     <width>22</width>
+     <height>160</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Orientation::Vertical</enum>
+   </property>
+  </widget>
+  <widget class="QSlider" name="Left_rotation">
+   <property name="geometry">
+    <rect>
+     <x>150</x>
+     <y>70</y>
+     <width>22</width>
+     <height>160</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Orientation::Vertical</enum>
+   </property>
+  </widget>
+  <widget class="QSlider" name="Right_rotation">
+   <property name="geometry">
+    <rect>
+     <x>440</x>
+     <y>70</y>
+     <width>22</width>
+     <height>160</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Orientation::Vertical</enum>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton">
+   <property name="geometry">
+    <rect>
+     <x>100</x>
+     <y>240</y>
+     <width>131</width>
+     <height>41</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>Coburn</family>
+     <pointsize>12</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="styleSheet">
+    <string>/* Aim_X lock - 紅色系 */
+QPushButton {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #f69797ff, stop:1 #e81828);
+    border: 2px solid #ff4444;
+    color: #ffffff;
+    border-radius: 6px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ff7777, stop:1 #f69797ff);
+    border: 2px solid #ffaaaa;
+}
+QPushButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #c40c0c, stop:1 #a00808);
+    border: 2px solid #ff0000;
+}</string>
+   </property>
+   <property name="text">
+    <string>Aim_X lock</string>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton_2">
+   <property name="geometry">
+    <rect>
+     <x>380</x>
+     <y>240</y>
+     <width>141</width>
+     <height>41</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>Coburn</family>
+     <pointsize>12</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="styleSheet">
+    <string>/* Aim_Y lock - 紅色系 */
+QPushButton {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #f69797ff, stop:1 #e81828);
+    border: 2px solid #ff4444;
+    color: #ffffff;
+    border-radius: 6px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ff7777, stop:1 #f69797ff);
+    border: 2px solid #ffaaaa;
+}
+QPushButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #c40c0c, stop:1 #a00808);
+    border: 2px solid #ff0000;
+}</string>
+   </property>
+   <property name="text">
+    <string>Aim_Y lock</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label">
+   <property name="geometry">
+    <rect>
+     <x>120</x>
+     <y>50</y>
+     <width>71</width>
+     <height>16</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>Coburn</family>
+     <pointsize>-1</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="text">
+    <string>Left rotation</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label_2">
+   <property name="geometry">
+    <rect>
+     <x>410</x>
+     <y>50</y>
+     <width>81</width>
+     <height>20</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>Coburn</family>
+     <pointsize>-1</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="text">
+    <string>Right rotation</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label_3">
+   <property name="geometry">
+    <rect>
+     <x>130</x>
+     <y>520</y>
+     <width>51</width>
+     <height>16</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>Coburn</family>
+     <pointsize>-1</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="text">
+    <string>Move_Y</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label_4">
+   <property name="geometry">
+    <rect>
+     <x>20</x>
+     <y>420</y>
+     <width>51</width>
+     <height>16</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>Coburn</family>
+     <pointsize>-1</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="text">
+    <string>Move_X</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label_5">
+   <property name="geometry">
+    <rect>
+     <x>420</x>
+     <y>520</y>
+     <width>51</width>
+     <height>16</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>Coburn</family>
+     <pointsize>-1</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="text">
+    <string>Aim_Y</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label_6">
+   <property name="geometry">
+    <rect>
+     <x>310</x>
+     <y>420</y>
+     <width>51</width>
+     <height>16</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>Coburn</family>
+     <pointsize>-1</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="text">
+    <string>Aim_X</string>
+   </property>
+  </widget>
+  <widget class="QSlider" name="Aim_X">
+   <property name="geometry">
+    <rect>
+     <x>370</x>
+     <y>420</y>
+     <width>160</width>
+     <height>22</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Orientation::Horizontal</enum>
+   </property>
+  </widget>
+  <widget class="QSlider" name="Aim_Y">
+   <property name="geometry">
+    <rect>
+     <x>440</x>
+     <y>350</y>
+     <width>22</width>
+     <height>160</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Orientation::Vertical</enum>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton_3">
+   <property name="geometry">
+    <rect>
+     <x>610</x>
+     <y>160</y>
+     <width>93</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>標楷體</family>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="mouseTracking">
+    <bool>true</bool>
+   </property>
+   <property name="styleSheet">
+    <string>/* 低轉速 - 綠色系（補給類） */
+QPushButton {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #22dd55, stop:1 #16d946);
+    border: 2px solid #16d946;
+    color: #ffffff;
+    border-radius: 6px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2dc759, stop:1 #22dd55);
+    border: 2px solid #2dc759;
+}
+QPushButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0d5a0d, stop:1 #0a450a);
+    border: 2px solid #ffffffff;
+}</string>
+   </property>
+   <property name="text">
+    <string>低轉速</string>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton_4">
+   <property name="geometry">
+    <rect>
+     <x>840</x>
+     <y>160</y>
+     <width>93</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>標楷體</family>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="styleSheet">
+    <string>/* 高轉速 - 黃色系（動力類） */
+QPushButton {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffee22, stop:1 #ffc400);
+    border: 2px solid #ffff00;
+    color: #000000;
+    border-radius: 6px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffff44, stop:1 #ffee22);
+    border: 2px solid #ffff88;
+}
+QPushButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ff9d00, stop:1 #ff8800);
+    border: 2px solid #ff6600;
+}</string>
+   </property>
+   <property name="text">
+    <string>高轉速</string>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton_5">
+   <property name="geometry">
+    <rect>
+     <x>730</x>
+     <y>250</y>
+     <width>93</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>標楷體</family>
+     <pointsize>10</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="styleSheet">
+    <string>/* 退彈 - 藍色系（發射類） */
+QPushButton {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0088ff, stop:1 #0066cc);
+    border: 2px solid #0066cc;
+    color: #ffffff;
+    border-radius: 6px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #33aaff, stop:1 #0088ff);
+    border: 2px solid #33aaff;
+}
+QPushButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #000aa6, stop:1 #000578);
+    border: 2px solid #0033ff;
+}</string>
+   </property>
+   <property name="text">
+    <string>退彈</string>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton_6">
+   <property name="geometry">
+    <rect>
+     <x>730</x>
+     <y>70</y>
+     <width>93</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>標楷體</family>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="styleSheet">
+    <string>/* 進彈 - 藍綠色系（提示不同功能） */
+QPushButton {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #00dd99, stop:1 #00b388);
+    border: 2px solid #00cc88;
+    color: #ffffff;
+    border-radius: 6px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #00ffaa, stop:1 #00dd99);
+    border: 2px solid #00ffaa;
+}
+QPushButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #008866, stop:1 #005544);
+    border: 2px solid #009977;
+}</string>
+   </property>
+   <property name="text">
+    <string>進彈</string>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Left_rotation_val">
+   <property name="geometry">
+    <rect>
+     <x>200</x>
+     <y>50</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Right_rotation_val">
+   <property name="geometry">
+    <rect>
+     <x>490</x>
+     <y>50</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Move_X_val">
+   <property name="geometry">
+    <rect>
+     <x>10</x>
+     <y>440</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Move_Y_val">
+   <property name="geometry">
+    <rect>
+     <x>190</x>
+     <y>520</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Aim_X_val">
+   <property name="geometry">
+    <rect>
+     <x>300</x>
+     <y>440</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Aim_Y_val">
+   <property name="geometry">
+    <rect>
+     <x>470</x>
+     <y>520</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

@@ -1,0 +1,386 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>850</width>
+    <height>800</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Laptop Remote Controller (Dark UI)</string>
+  </property>
+  <property name="styleSheet">
+   <string notr="true">
+/* 全域設定 */
+QMainWindow {
+    background-color: #1e1e1e;
+    color: #e0e0e0;
+    font-family: &quot;Segoe UI&quot;, &quot;Microsoft JhengHei&quot;, sans-serif;
+    font-size: 10pt;
+}
+
+/* 群組框 */
+QGroupBox {
+    border: 1px solid #444;
+    border-radius: 6px;
+    margin-top: 24px;
+    padding-top: 10px;
+    background-color: #252526;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    padding: 0 5px;
+    color: #00e5ff;
+    font-weight: bold;
+    background-color: #1e1e1e;
+}
+
+/* 標籤 */
+QLabel {
+    color: #cccccc;
+}
+
+/* 輸入框 */
+QLineEdit {
+    background-color: #2d2d30;
+    border: 1px solid #3e3e42;
+    border-radius: 4px;
+    color: #ffffff;
+    padding: 4px;
+    font-family: &quot;Consolas&quot;, monospace;
+}
+QLineEdit:focus {
+    border: 1px solid #007acc;
+}
+
+/* 按鈕 - 通用 */
+QPushButton {
+    background-color: #3e3e42;
+    color: #ffffff;
+    border: 1px solid #555;
+    border-radius: 4px;
+    padding: 6px 12px;
+    min-width: 60px;
+}
+QPushButton:hover {
+    background-color: #505050;
+    border-color: #00e5ff;
+}
+QPushButton:pressed {
+    background-color: #007acc;
+    border-color: #007acc;
+}
+
+/* 特殊按鈕 ID 指定 */
+QPushButton#btn_connect {
+    background-color: #007acc;
+    font-weight: bold;
+}
+QPushButton#btn_connect:hover {
+    background-color: #0098ff;
+}
+
+QPushButton#btn_step_s {
+    background-color: #d32f2f;
+    font-weight: bold;
+}
+QPushButton#btn_step_s:hover {
+    background-color: #f44336;
+}
+
+QPushButton#btn_neo_0, QPushButton#btn_neo_n50, QPushButton#btn_neo_n100, QPushButton#btn_raw, QPushButton#btn_status {
+    background-color: #2d2d30;
+}
+
+/* 滑桿 */
+QSlider::groove:horizontal {
+    border: 1px solid #3e3e42;
+    height: 8px;
+    background: #2d2d30;
+    margin: 2px 0;
+    border-radius: 4px;
+}
+QSlider::handle:horizontal {
+    background: #00e5ff;
+    border: 1px solid #00e5ff;
+    width: 16px;
+    height: 16px;
+    margin: -5px 0;
+    border-radius: 8px;
+}
+
+/* Log 區域 */
+QTextEdit {
+    background-color: #000000;
+    color: #00ff00;
+    font-family: &quot;Consolas&quot;, &quot;Courier New&quot;, monospace;
+    border: 1px solid #333;
+    font-size: 9pt;
+}
+   </string>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="verticalLayout">
+    <item>
+     <layout class="QHBoxLayout" name="layout_conn">
+      <item>
+       <widget class="QLabel" name="label_ip">
+        <property name="text">
+         <string>Pi IP:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLineEdit" name="input_ip">
+        <property name="text">
+         <string>10.254.97.208</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="label_port">
+        <property name="text">
+         <string>Port:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLineEdit" name="input_port">
+        <property name="text">
+         <string>5000</string>
+        </property>
+        <property name="maximumWidth">
+         <number>80</number>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="btn_connect">
+        <property name="text">
+         <string>連線</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="lbl_status">
+        <property name="text">
+         <string>未連線</string>
+        </property>
+        <property name="styleSheet">
+         <string>color: #888888; font-weight: bold;</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <spacer name="horizontalSpacer">
+        <property name="orientation">
+         <enum>Qt::Horizontal</enum>
+        </property>
+        <property name="sizeHint" stdset="0">
+         <size>
+          <width>40</width>
+          <height>20</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+     </layout>
+    </item>
+
+    <item>
+     <widget class="QGroupBox" name="grp_chassis">
+      <property name="title">
+       <string>底盤控制 (W/A/S/D + Arrows)</string>
+      </property>
+      <layout class="QHBoxLayout" name="horizontalLayout_2">
+       <item>
+        <widget class="QLabel" name="label_speed">
+         <property name="text">
+          <string>速度倍率:</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QSlider" name="slider_speed">
+         <property name="orientation">
+          <enum>Qt::Horizontal</enum>
+         </property>
+         <property name="minimum">
+          <number>0</number>
+         </property>
+         <property name="maximum">
+          <number>100</number>
+         </property>
+         <property name="value">
+          <number>60</number>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="lbl_speed_val">
+         <property name="text">
+          <string>0.60</string>
+         </property>
+         <property name="minimumWidth">
+            <number>40</number>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="Line" name="line">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="lbl_vx">
+         <property name="text">
+          <string>vx=0.00</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="lbl_vy">
+         <property name="text">
+          <string>vy=0.00</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="lbl_wz">
+         <property name="text">
+          <string>wz=0.00</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </item>
+
+    <item>
+     <widget class="QGroupBox" name="grp_shooter">
+      <property name="title">
+       <string>Shooter 控制</string>
+      </property>
+      <layout class="QGridLayout" name="gridLayout_shooter">
+       <item row="0" column="0">
+        <widget class="QLabel" name="label_step"><property name="text"><string>步進 (F/R/X):</string></property></widget>
+       </item>
+       <item row="0" column="1">
+        <widget class="QPushButton" name="btn_step_f"><property name="text"><string>F</string></property></widget>
+       </item>
+       <item row="0" column="2">
+        <widget class="QPushButton" name="btn_step_r"><property name="text"><string>R</string></property></widget>
+       </item>
+       <item row="0" column="3">
+        <widget class="QPushButton" name="btn_step_s"><property name="text"><string>Stop (X)</string></property></widget>
+       </item>
+
+       <item row="1" column="0">
+        <widget class="QLabel" name="label_servo"><property name="text"><string>Servo (1/2/3):</string></property></widget>
+       </item>
+       <item row="1" column="1">
+        <widget class="QPushButton" name="btn_servo_1"><property name="text"><string>S1</string></property></widget>
+       </item>
+       <item row="1" column="2">
+        <widget class="QPushButton" name="btn_servo_2"><property name="text"><string>S2</string></property></widget>
+       </item>
+       <item row="1" column="3">
+        <widget class="QPushButton" name="btn_servo_3"><property name="text"><string>S3</string></property></widget>
+       </item>
+
+       <item row="2" column="0">
+        <widget class="QLabel" name="label_neo"><property name="text"><string>NEO 速度:</string></property></widget>
+       </item>
+       <item row="2" column="1">
+        <widget class="QPushButton" name="btn_neo_0"><property name="text"><string>0 (Stop)</string></property></widget>
+       </item>
+       <item row="2" column="2">
+        <widget class="QPushButton" name="btn_neo_n50"><property name="text"><string>-50</string></property></widget>
+       </item>
+       <item row="2" column="3">
+        <widget class="QPushButton" name="btn_neo_n100"><property name="text"><string>-100</string></property></widget>
+       </item>
+      </layout>
+     </widget>
+    </item>
+
+    <item>
+     <widget class="QGroupBox" name="grp_aim">
+      <property name="title">
+       <string>AIM 手動控制 (L/J -> M1, I/K -> M2)</string>
+      </property>
+      <layout class="QGridLayout" name="gridLayout_aim">
+       <item row="0" column="0"><widget class="QLabel" name="lbl_m1"><property name="text"><string>M1 = 0.0°</string></property></widget></item>
+       <item row="0" column="1"><widget class="QPushButton" name="btn_m1_dec"><property name="text"><string>M1 -</string></property></widget></item>
+       <item row="0" column="2"><widget class="QPushButton" name="btn_m1_inc"><property name="text"><string>M1 +</string></property></widget></item>
+       <item row="0" column="3"><widget class="QPushButton" name="btn_m1_set0"><property name="text"><string>設為原點</string></property></widget></item>
+       <item row="0" column="4"><widget class="QPushButton" name="btn_m1_go0"><property name="text"><string>回原點</string></property></widget></item>
+
+       <item row="1" column="0"><widget class="QLabel" name="lbl_m2"><property name="text"><string>M2 = 0.0°</string></property></widget></item>
+       <item row="1" column="1"><widget class="QPushButton" name="btn_m2_dec"><property name="text"><string>M2 -</string></property></widget></item>
+       <item row="1" column="2"><widget class="QPushButton" name="btn_m2_inc"><property name="text"><string>M2 +</string></property></widget></item>
+       <item row="1" column="3"><widget class="QPushButton" name="btn_m2_set0"><property name="text"><string>設為原點</string></property></widget></item>
+       <item row="1" column="4"><widget class="QPushButton" name="btn_m2_go0"><property name="text"><string>回原點</string></property></widget></item>
+      </layout>
+     </widget>
+    </item>
+
+    <item>
+     <widget class="QGroupBox" name="grp_presets">
+      <property name="title">
+       <string>AIM 預設角度 (9 檔案槽 + 10 參數)</string>
+      </property>
+      <layout class="QVBoxLayout" name="layout_presets">
+        <item>
+            <widget class="QLabel" name="lbl_file_info">
+                <property name="text"><string>未選擇檔案槽</string></property>
+            </widget>
+        </item>
+        <item>
+            <widget class="QWidget" name="container_file_btns" native="true">
+                <layout class="QGridLayout" name="grid_files"/>
+            </widget>
+        </item>
+        <item>
+            <widget class="QLabel" name="lbl_param_info">
+                <property name="text"><string>未選擇參數</string></property>
+                </widget>
+        </item>
+        <item>
+            <widget class="QWidget" name="container_param_btns" native="true">
+                <layout class="QGridLayout" name="grid_params"/>
+            </widget>
+        </item>
+      </layout>
+     </widget>
+    </item>
+
+    <item>
+      <layout class="QHBoxLayout" name="layout_raw">
+        <item><widget class="QLineEdit" name="input_raw"><property name="placeholderText"><string>RAW 指令...</string></property></widget></item>
+        <item><widget class="QPushButton" name="btn_raw"><property name="text"><string>送出 RAW</string></property></widget></item>
+        <item><widget class="QPushButton" name="btn_status"><property name="text"><string>STATUS</string></property></widget></item>
+      </layout>
+    </item>
+
+    <item>
+     <widget class="QTextEdit" name="txt_log">
+      <property name="readOnly">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+   </layout>
+ </widget>
+</widget>
+ <resources/>
+ <connections/>
+</ui>

@@ -1,0 +1,16 @@
+TEL2025_MainCode
+└─ ALL_TEXTS.txt
+└─ XboxGUI_V1.ui
+└─ XboxGUI_V2.ui
+└─ aim.py
+└─ files_content.jsonl
+└─ files_report.csv
+└─ files_tree.txt
+└─ main.py
+└─ mega1_controller.py
+└─ scan_folder.py
+└─ xboxGUI.py
+└─ aim
+    └─ aim.ino
+└─ chassis_shooter
+    └─ chassis_shooter.ino

@@ -1,0 +1,1961 @@
+
+================================================================================
+FILE: aim.py
+================================================================================
+# aim.py
+# 右搖桿採「微調」（相對位移），非絕對角度：
+#   每幀 Δ角度 = stick * SENS_DEG_PER_S * Δt；夾限到 [min,max]
+#   送出 "1,<xdeg>" / "2,<ydeg>"
+from __future__ import annotations
+from typing import Optional, TYPE_CHECKING, Tuple
+import time
+
+try:
+    import serial as pyserial
+except Exception:
+    pyserial = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:
+    from serial import Serial as SerialT
+else:
+    class SerialT: pass
+
+def _clamp(x, a, b): return a if x < a else b if x > b else x
+
+
+class Aimer:
+    def __init__(self, port="COM18", baud=115200, send_interval_ms=80, verbose=True,
+                 x_min_deg=-30.0, x_max_deg=+30.0, y_min_deg=+10.0, y_max_deg=+80.0,
+                 x_sens_deg_s=60.0, y_sens_deg_s=60.0):
+        self.port, self.baud, self.verbose = port, baud, verbose
+        self._ser: Optional[SerialT] = None
+        self._interval = send_interval_ms / 1000.0
+        self._last_send = 0.0
+        self._x_rng = (float(x_min_deg), float(x_max_deg))
+        self._y_rng = (float(y_min_deg), float(y_max_deg))
+        self._x = (x_min_deg + x_max_deg) / 2.0
+        self._y = (y_min_deg + y_max_deg) / 2.0
+        self._last_xy: Tuple[float, float] = (9999, 9999)
+        self._sx = float(x_sens_deg_s)
+        self._sy = float(y_sens_deg_s)
+        self._connect()
+
+    # ---- serial ----
+    def _connect(self):
+        if pyserial is None:
+            if self.verbose: print("[AIM] pyserial 未安裝，dryrun")
+            return
+        try:
+            self._ser = pyserial.Serial(self.port, self.baud, timeout=0.02)
+            if self.verbose: print(f"[AIM] OPEN {self.port} @ {self.baud}")
+            time.sleep(1.5)
+        except Exception as e:
+            self._ser = None
+            if self.verbose: print(f"[AIM] 開啟失敗：{e}（dryrun）")
+
+    def _send_line(self, s: str):
+        if not s.endswith("\n"): s += "\n"
+        if self._ser:
+            try: self._ser.write(s.encode("utf-8"))
+            except Exception as e:
+                if self.verbose: print(f"[AIM] 寫入失敗：{e}")
+        else:
+            if self.verbose: print(f"[AIM] (drysend) {s.strip()}")
+
+    # ---- 相對微調 ----
+    def nudge_from_stick(self, rx: float, ry: float, dt: float):
+        """rx, ry ∈ [-1,1]；dt 秒；上推為正 → y 取反號"""
+        if dt <= 0: return
+        dx = float(rx) * self._sx * dt
+        dy = float(-ry) * self._sy * dt
+        self._x = _clamp(self._x + dx, *self._x_rng)
+        self._y = _clamp(self._y + dy, *self._y_rng)
+        self._maybe_send()
+
+    def _maybe_send(self):
+        now = time.time()
+        if now - self._last_send < self._interval:
+            return
+        cur = (round(self._x, 3), round(self._y, 3))
+        if cur == self._last_xy:
+            return
+        self._last_send = now
+        self._last_xy = cur
+        self._send_line(f"1,{cur[0]:.3f}")
+        self._send_line(f"2,{cur[1]:.3f}")
+
+    # 可選：置中 / 直接設角度
+    def home_center(self):
+        self._x = sum(self._x_rng) * 0.5
+        self._y = sum(self._y_rng) * 0.5
+        self._maybe_send()
+
+    def set_xy_deg(self, x_deg: float, y_deg: float):
+        self._x = _clamp(float(x_deg), *self._x_rng)
+        self._y = _clamp(float(y_deg), *self._y_rng)
+        self._maybe_send()
+
+    def close(self):
+        if self._ser:
+            try: self._ser.close()
+            finally: self._ser = None
+            if self.verbose: print("[AIM] CLOSED")
+    
+================================================================================
+FILE: ALL_TEXTS.txt
+================================================================================
+[[EMPTY OR UNREADABLE TEXT]]
+
+================================================================================
+FILE: files_content.jsonl
+================================================================================
+[[EMPTY OR UNREADABLE TEXT]]
+
+================================================================================
+FILE: files_report.csv
+================================================================================
+[[EMPTY OR UNREADABLE TEXT]]
+
+================================================================================
+FILE: files_tree.txt
+================================================================================
+TEL2025_MainCode
+└─ ALL_TEXTS.txt
+└─ XboxGUI_V1.ui
+└─ XboxGUI_V2.ui
+└─ aim.py
+└─ files_content.jsonl
+└─ files_report.csv
+└─ files_tree.txt
+└─ main.py
+└─ mega1_controller.py
+└─ scan_folder.py
+└─ xboxGUI.py
+└─ aim
+    └─ aim.ino
+└─ chassis_shooter
+    └─ chassis_shooter.ino
+================================================================================
+FILE: main.py
+================================================================================
+# main.py
+# 將 xboxGUI 的 6 軸/6 鍵事件 → MegaController / Aimer
+# 規格：
+#   進料=R、退料=F、低速=-50、高速=-100
+#   前後=左搖桿 Y（vx）、左右=左搖桿 X（vy）
+#   旋轉=AXIS5(右) - AXIS4(左) → [-100..100]
+#   BTN4(LB)=Aim_X lock、BTN5(RB)=Aim_Y lock（按住鎖定該軸為 0）
+
+import time
+import xboxGUI
+from mega1_controller import MegaController
+from aim import Aimer
+
+# ===== 連線參數 =====
+MEGA_PORT = "COM19"
+AIM_PORT  = "COM18"
+BAUD      = 115200
+
+# 比例（可依需要調整）
+SCALE_FWD  = 100.0  # 前後百分比 = ly * SCALE_FWD
+SCALE_MOVE = 100.0  # 左右百分比 = lx * SCALE_MOVE
+SCALE_ROT  = 100.0  # 自旋百分比 = (rot_r_pos - rot_l_pos) * SCALE_ROT
+
+def _to_pos(v):  # 觸發鍵 [-1..+1] → [0..1]
+    return (float(v) + 1.0) * 0.5
+
+mega  = MegaController(port=MEGA_PORT, baud=BAUD, send_interval_s=0.08, verbose=True)
+aimer = Aimer(port=AIM_PORT,  baud=BAUD, send_interval_ms=80,  verbose=True)
+
+aim_x_locked = False
+aim_y_locked = False
+_last_t = time.monotonic()
+
+def on_axis(lx, ly, rx, ry, rot_l, rot_r):
+    global _last_t
+    now = time.monotonic()
+    dt  = max(0.0, now - _last_t)
+    _last_t = now
+
+    # 前後 & 左右
+    mega.move_forward(int(-ly * SCALE_FWD))
+    mega.move_XY(int(lx * SCALE_MOVE))
+
+    # 旋轉（AXIS5 - AXIS4）
+    rot_percent = int((_to_pos(rot_r) - _to_pos(rot_l)) * SCALE_ROT)
+    mega.rotate(rot_percent)
+
+    # Aim：鎖定時把對應軸視為 0（不微調）
+    rx_eff = 0.0 if aim_x_locked else rx
+    ry_eff = 0.0 if aim_y_locked else ry
+    aimer.nudge_from_stick(rx_eff, ry_eff, dt)
+
+def on_buttons(a, b, x, y, lb, rb):
+    global aim_x_locked, aim_y_locked
+    # 射手（R/F/-50/-100）
+    if b: mega.feed()        # R
+    if x: mega.reverse()     # F
+    if a: mega.set_neo(-50)
+    if y: mega.set_neo(-100)
+
+    # 鎖定：按住即鎖（鬆開即解除）
+    aim_x_locked = bool(lb)  # BTN4
+    aim_y_locked = bool(rb)  # BTN5
+
+def main():
+    try:
+        xboxGUI.run({"on_axis": on_axis, "on_buttons": on_buttons})
+    finally:
+        try: mega.close()
+        except: pass
+        try: aimer.close()
+        except: pass
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+FILE: mega1_controller.py
+================================================================================
+# mega1_controller.py
+# CHASSIS: 週期送 "vx,vy,wz\n"（vx/前後、vy/左右、wz/自旋）
+# SHOOTER: "R"/"F"/整數 -100..100
+from __future__ import annotations
+import threading, time
+from typing import Optional, TYPE_CHECKING
+
+try:
+    import serial as pyserial
+except Exception:
+    pyserial = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:
+    from serial import Serial as SerialT
+else:
+    class SerialT: pass
+
+
+class MegaController:
+    MODE_CHASSIS = "CHASSIS"
+    MODE_SHOOTER = "SHOOTER"
+
+    def __init__(self, port="COM19", baud=115200, send_interval_s=0.08, verbose=True):
+        self.port, self.baud, self.verbose = port, baud, verbose
+        self._ser: Optional[SerialT] = None
+        self._vx = 0.0; self._vy = 0.0; self._wz = 0.0
+        self._interval = max(0.01, float(send_interval_s))
+        self._mode = self.MODE_CHASSIS
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._connect()
+        self._start_tx_loop()
+
+    # ---- serial ----
+    def _connect(self):
+        if pyserial is None:
+            if self.verbose: print("[Mega] pyserial 未安裝，dryrun")
+            return
+        try:
+            self._ser = pyserial.Serial(self.port, self.baud, timeout=0.0, write_timeout=0.0)
+            if self.verbose: print(f"[Mega] OPEN {self.port} @ {self.baud}")
+            time.sleep(1.5)
+            self._send_line(f"MODE {self._mode}")
+        except Exception as e:
+            self._ser = None
+            if self.verbose: print(f"[Mega] 開啟失敗：{e}（dryrun）")
+
+    def _close(self):
+        if self._ser:
+            try: self._ser.close()
+            finally: self._ser = None
+            if self.verbose: print("[Mega] CLOSED")
+
+    def _send_line(self, s: str):
+        if not s.endswith("\n"): s += "\n"
+        if self._ser:
+            try: self._ser.write(s.encode("ascii"))
+            except Exception as e:
+                if self.verbose: print(f"[Mega] 寫入失敗：{e}")
+        else:
+            if self.verbose: print(f"[Mega] (drysend) {s.strip()}")
+
+    # ---- 背景廣播（僅 CHASSIS）----
+    def _start_tx_loop(self):
+        def loop():
+            next_t = 0.0
+            while not self._stop.is_set():
+                now = time.monotonic()
+                if now >= next_t:
+                    with self._lock:
+                        mode, vx, vy, wz = self._mode, self._vx, self._vy, self._wz
+                    if mode == self.MODE_CHASSIS:
+                        self._send_line(f"{vx:.2f},{vy:.2f},{wz:.2f}")
+                    next_t = now + self._interval
+                time.sleep(0.002)
+        threading.Thread(target=loop, daemon=True).start()
+
+    # ---- 公開 API ----
+    def move_forward(self, percent: int):
+        """前後（-100..100 → vx -1..1）"""
+        p = max(-100, min(100, int(percent)))
+        with self._lock:
+            self._vx = p / 100.0
+        if abs(p) > 0: self.set_mode(self.MODE_CHASSIS)
+
+    def move_XY(self, percent: int):
+        """左右（-100..100 → vy -1..1）"""
+        p = max(-100, min(100, int(percent)))
+        with self._lock:
+            self._vy = p / 100.0
+        if abs(p) > 0: self.set_mode(self.MODE_CHASSIS)
+    move_xy = move_XY  # 別名
+
+    def rotate(self, percent: int):
+        """自旋（-100..100 → wz -1..1）"""
+        p = max(-100, min(100, int(percent)))
+        with self._lock:
+            self._wz = p / 100.0
+        if abs(p) > 0: self.set_mode(self.MODE_CHASSIS)
+
+    # 射手端
+    def feed(self):       # 'R'
+        self.set_mode(self.MODE_SHOOTER)
+        self._send_line("R")
+
+    def reverse(self):    # 'F'
+        self.set_mode(self.MODE_SHOOTER)
+        self._send_line("F")
+
+    def set_neo(self, speed: int):  # -100..100
+        v = int(max(-100, min(100, speed)))
+        self.set_mode(self.MODE_SHOOTER)
+        self._send_line(str(v))
+
+    def set_mode(self, mode: str):
+        if mode not in (self.MODE_CHASSIS, self.MODE_SHOOTER): return
+        with self._lock:
+            if mode == self._mode: return
+            self._mode = mode
+        self._send_line(f"MODE {mode}")
+        time.sleep(0.2)  # 切模式保險緩衝
+
+    def close(self):
+        self._stop.set(); time.sleep(0.05); self._close()
+
+================================================================================
+FILE: scan_folder.py
+================================================================================
+# scan_folder.py
+# -*- coding: utf-8 -*-
+import os, sys, csv, time, json, base64, hashlib
+from collections import defaultdict
+
+DEFAULT_TARGET = r"C:\Users\user\OneDrive - 中原大學\桌面\大學作品集\東京威力\TEL2025_MainCode"
+
+# 略過的資料夾
+SKIP_DIRS = {
+    ".git","__pycache__","node_modules",".venv","venv","env",
+    "build","dist",".idea",".vscode",".pytest_cache",".mypy_cache",".cache"
+}
+
+# 當作文字檔處理（小寫副檔名）
+TEXT_EXTS = {
+    ".py",".c",".cpp",".h",".hpp",".java",".js",".ts",".sh",".bat",".ps1",".ino",
+    ".go",".rb",".php",".swift",".kt",".m",".cs",".json",".yml",".yaml",".toml",
+    ".ini",".md",".txt",".csv",".xml",".html",".css"
+}
+
+# 內容輸出控制
+MAX_TEXT_BYTES = 512 * 1024      # 單一文字檔最多讀 512 KB 內容
+MAX_BINARY_BYTES = 0             # 二進位檔是否輸出 base64（0=不輸出，只記錄雜湊與中繼資料）
+ENCODING = "utf-8"               # 文字讀取編碼（失敗則用 errors='replace'）
+
+def is_probably_binary(path, ext) -> bool:
+    if ext.lower() in TEXT_EXTS:
+        return False
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+        # 有 NUL 或太多非可列印控制字 → 視為二進位
+        if b"\x00" in head:
+            return True
+        nontext = sum(1 for b in head if b < 9 or (13 < b < 32) or b == 127)
+        return nontext / max(1, len(head)) > 0.30
+    except Exception:
+        return True
+
+def human_size(n: int) -> str:
+    units = ["B","KB","MB","GB","TB"]
+    i, f = 0, float(n)
+    while f >= 1024 and i < len(units)-1:
+        f /= 1024; i += 1
+    return f"{f:.2f} {units[i]}"
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def gen_tree(root: str, skip_dirs=SKIP_DIRS, max_files_per_dir=200) -> str:
+    lines = []
+    root = os.path.abspath(root)
+    for current_root, dirs, files in os.walk(root):
+        rel = os.path.relpath(current_root, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        indent = "    " * depth
+        lines.append((os.path.basename(root) if rel == "." else f"{'    '*(depth-1)}└─ {os.path.basename(current_root)}"))
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        shown = 0
+        for name in sorted(files):
+            if shown >= max_files_per_dir:
+                lines.append(f"{indent}└─ ... ({len(files)-shown} more files)")
+                break
+            lines.append(f"{indent}└─ {name}")
+            shown += 1
+    return "\n".join(lines)
+
+def main():
+    target = sys.argv[1] if len(sys.argv) >= 2 else DEFAULT_TARGET
+    target = os.path.abspath(os.path.expanduser(target))
+    if not os.path.isdir(target):
+        print(f"❌ 找不到資料夾：{target}")
+        sys.exit(1)
+
+    out_csv  = os.path.join(target, "files_report.csv")
+    out_tree = os.path.join(target, "files_tree.txt")
+    out_jsonl = os.path.join(target, "files_content.jsonl")
+    out_alltxt = os.path.join(target, "ALL_TEXTS.txt")
+
+    by_ext_count = defaultdict(int)
+    by_ext_size = defaultdict(int)
+    total_files = total_bytes = 0
+
+    # 先寫 CSV（中繼資料）
+    with open(out_csv, "w", newline="", encoding="utf-8-sig") as fcsv, \
+         open(out_jsonl, "w", encoding="utf-8") as fjsonl, \
+         open(out_alltxt, "w", encoding="utf-8", errors="replace") as falltxt:
+
+        writer = csv.writer(fcsv)
+        writer.writerow([
+            "relative_path", "extension", "size_bytes", "size_human",
+            "modified_time", "is_text", "line_count", "sha256"
+        ])
+
+        for root_dir, dirs, files in os.walk(target):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for fname in files:
+                fpath = os.path.join(root_dir, fname)
+                rel = os.path.relpath(fpath, target)
+                ext = os.path.splitext(fname)[1].lower()
+
+                try:
+                    stat = os.stat(fpath)
+                except OSError:
+                    continue
+
+                size = stat.st_size
+                mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime))
+                is_bin = is_probably_binary(fpath, ext)
+                sha256 = sha256_file(fpath)
+
+                line_count = ""
+                text_preview = ""
+                encoding_used = None
+
+                if not is_bin:
+                    # 讀部分文字內容（限制大小）
+                    try:
+                        with open(fpath, "r", encoding=ENCODING, errors="replace") as fr:
+                            content = fr.read(min(MAX_TEXT_BYTES, size))
+                            encoding_used = ENCODING
+                            text_preview = content
+                            line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+                    except Exception:
+                        pass
+
+                    # 寫入 ALL_TEXTS 匯總
+                    falltxt.write("\n" + "="*80 + "\n")
+                    falltxt.write(f"FILE: {rel}\n")
+                    falltxt.write("="*80 + "\n")
+                    if text_preview:
+                        falltxt.write(text_preview)
+                        if size > MAX_TEXT_BYTES:
+                            falltxt.write("\n[... TRUNCATED ...]\n")
+                    else:
+                        falltxt.write("[[EMPTY OR UNREADABLE TEXT]]\n")
+
+                    # JSONL：文字
+                    json.dump({
+                        "path": rel,
+                        "extension": ext or "(noext)",
+                        "size_bytes": size,
+                        "modified_time": mtime,
+                        "sha256": sha256,
+                        "is_text": True,
+                        "encoding": encoding_used or "utf-8",
+                        "truncated": bool(size > MAX_TEXT_BYTES),
+                        "content": text_preview
+                    }, fjsonl, ensure_ascii=False)
+                    fjsonl.write("\n")
+
+                else:
+                    # JSONL：二進位（預設不含內容，只記雜湊與中繼資料；需要可改 MAX_BINARY_BYTES）
+                    b64 = None
+                    if MAX_BINARY_BYTES > 0:
+                        try:
+                            with open(fpath, "rb") as fb:
+                                raw = fb.read(min(MAX_BINARY_BYTES, size))
+                            b64 = base64.b64encode(raw).decode("ascii")
+                        except Exception:
+                            b64 = None
+
+                    json.dump({
+                        "path": rel,
+                        "extension": ext or "(noext)",
+                        "size_bytes": size,
+                        "modified_time": mtime,
+                        "sha256": sha256,
+                        "is_text": False,
+                        "base64_bytes": b64,
+                        "truncated": bool(size > MAX_BINARY_BYTES) if MAX_BINARY_BYTES > 0 else None
+                    }, fjsonl)
+                    fjsonl.write("\n")
+
+                # CSV（中繼資料一覽）
+                writer.writerow([
+                    rel, ext or "(noext)", size, human_size(size), mtime,
+                    int(not is_bin), line_count, sha256
+                ])
+
+                by_ext_count[ext] += 1
+                by_ext_size[ext] += size
+                total_files += 1
+                total_bytes += size
+
+    # 產生樹狀
+    with open(out_tree, "w", encoding="utf-8") as ftree:
+        ftree.write(gen_tree(target))
+
+    # 摘要
+    print("📁 掃描完成：", target)
+    print(f"   檔案總數：{total_files}")
+    print(f"   總大小  ：{human_size(total_bytes)}")
+    print("   依副檔名統計（前 15 名）：")
+    top = sorted(by_ext_count.items(), key=lambda kv: by_ext_size[kv[0]], reverse=True)[:15]
+    for ext, cnt in top:
+        print(f"   {ext or '(noext)':>8}  {cnt:>6} 檔  {human_size(by_ext_size[ext]):>10}")
+
+    print(f"\n✅ 已輸出：\n  - {out_csv}\n  - {out_tree}\n  - {out_jsonl}\n  - {out_alltxt}")
+    print("\n⚙️ 參數：MAX_TEXT_BYTES={}, MAX_BINARY_BYTES={}（可在檔頭調整）".format(MAX_TEXT_BYTES, MAX_BINARY_BYTES))
+    print("💡 JSONL 可被 jq / pandas / BigQuery / Elasticsearch 等直接使用；ALL_TEXTS.txt 方便人工檢視。")
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+FILE: xboxGUI.py
+================================================================================
+# xboxGUI.py
+# 對外 API：run(handlers)
+# handlers = {
+#   "on_axis":    callable(lx, ly, rx, ry, rot_l, rot_r),  # floats in [-1,1]
+#   "on_buttons": callable(a,b,x,y,lb,rb),                 # bools
+# }
+
+import pygame
+
+# 常見 XInput 映射（如與你手把不同可在此調整）
+AX_LX, AX_LY, AX_RX, AX_RY, AX_ROT_L, AX_ROT_R = 0, 1, 2, 3, 4, 5
+BTN_A, BTN_B, BTN_X, BTN_Y, BTN_LB, BTN_RB = 0, 1, 2, 3, 4, 5
+
+def _dead(v, dz=0.15):
+    return 0.0 if abs(v) < dz else float(v)
+
+def run(handlers: dict, fps: int = 120):
+    on_axis = handlers.get("on_axis")
+    on_btn  = handlers.get("on_buttons")
+
+    pygame.init()
+    pygame.joystick.init()
+
+    js = None
+    if pygame.joystick.get_count() > 0:
+        js = pygame.joystick.Joystick(0); js.init()
+        print(f"[xboxGUI] Joystick: {js.get_name()}")
+    else:
+        print("[xboxGUI] 找不到搖桿，仍啟動迴圈（回傳全 0）。")
+
+    clock = pygame.time.Clock()
+    a = b = x = y = lb = rb = False
+
+    while True:
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                return
+            if e.type == pygame.JOYBUTTONDOWN:
+                if e.button == BTN_A: a = True
+                elif e.button == BTN_B: b = True
+                elif e.button == BTN_X: x = True
+                elif e.button == BTN_Y: y = True
+                elif e.button == BTN_LB: lb = True
+                elif e.button == BTN_RB: rb = True
+            if e.type == pygame.JOYBUTTONUP:
+                if e.button == BTN_A: a = False
+                elif e.button == BTN_B: b = False
+                elif e.button == BTN_X: x = False
+                elif e.button == BTN_Y: y = False
+                elif e.button == BTN_LB: lb = False
+                elif e.button == BTN_RB: rb = False
+
+        if js:
+            lx     = _dead(js.get_axis(AX_LX))
+            ly     = _dead(js.get_axis(AX_LY))
+            rx     = _dead(js.get_axis(AX_RX))
+            ry     = _dead(js.get_axis(AX_RY))
+            rot_l  = float(js.get_axis(AX_ROT_L))  # 多數觸發鍵：鬆開≈-1、壓到底≈+1
+            rot_r  = float(js.get_axis(AX_ROT_R))
+        else:
+            lx = ly = rx = ry = rot_l = rot_r = 0.0
+
+        if on_axis:
+            try: on_axis(lx, ly, rx, ry, rot_l, rot_r)
+            except Exception as e: print(f"[xboxGUI] on_axis error: {e}")
+        if on_btn:
+            try: on_btn(a, b, x, y, lb, rb)
+            except Exception as e: print(f"[xboxGUI] on_buttons error: {e}")
+
+        clock.tick(fps)
+
+================================================================================
+FILE: XboxGUI_V1.ui
+================================================================================
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>Form</class>
+ <widget class="QWidget" name="Form">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>999</width>
+    <height>575</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Form</string>
+  </property>
+  <widget class="QSlider" name="Move_X">
+   <property name="geometry">
+    <rect>
+     <x>80</x>
+     <y>420</y>
+     <width>160</width>
+     <height>22</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Horizontal</enum>
+   </property>
+  </widget>
+  <widget class="QSlider" name="Move_Y">
+   <property name="geometry">
+    <rect>
+     <x>150</x>
+     <y>350</y>
+     <width>22</width>
+     <height>160</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Vertical</enum>
+   </property>
+  </widget>
+  <widget class="QSlider" name="Left_rotation">
+   <property name="geometry">
+    <rect>
+     <x>150</x>
+     <y>70</y>
+     <width>22</width>
+     <height>160</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Vertical</enum>
+   </property>
+  </widget>
+  <widget class="QSlider" name="Right_rotation">
+   <property name="geometry">
+    <rect>
+     <x>440</x>
+     <y>70</y>
+     <width>22</width>
+     <height>160</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Vertical</enum>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton">
+   <property name="geometry">
+    <rect>
+     <x>110</x>
+     <y>240</y>
+     <width>93</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string>Aim_X lock</string>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton_2">
+   <property name="geometry">
+    <rect>
+     <x>410</x>
+     <y>240</y>
+     <width>93</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string>Aim_Y lock</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label">
+   <property name="geometry">
+    <rect>
+     <x>120</x>
+     <y>50</y>
+     <width>71</width>
+     <height>16</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string>Left rotation</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label_2">
+   <property name="geometry">
+    <rect>
+     <x>410</x>
+     <y>50</y>
+     <width>81</width>
+     <height>20</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string>Right rotation</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label_3">
+   <property name="geometry">
+    <rect>
+     <x>130</x>
+     <y>520</y>
+     <width>51</width>
+     <height>16</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string>Move_Y</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label_4">
+   <property name="geometry">
+    <rect>
+     <x>20</x>
+     <y>420</y>
+     <width>51</width>
+     <height>16</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string>Move_X</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label_5">
+   <property name="geometry">
+    <rect>
+     <x>420</x>
+     <y>520</y>
+     <width>51</width>
+     <height>16</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string>Aim_Y</string>
+   </property>
+  </widget>
+  <widget class="QSlider" name="Aim_X">
+   <property name="geometry">
+    <rect>
+     <x>370</x>
+     <y>420</y>
+     <width>160</width>
+     <height>22</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Horizontal</enum>
+   </property>
+  </widget>
+  <widget class="QSlider" name="Aim_Y">
+   <property name="geometry">
+    <rect>
+     <x>440</x>
+     <y>350</y>
+     <width>22</width>
+     <height>160</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Vertical</enum>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label_6">
+   <property name="geometry">
+    <rect>
+     <x>310</x>
+     <y>420</y>
+     <width>51</width>
+     <height>16</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string>Aim_X</string>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton_3">
+   <property name="geometry">
+    <rect>
+     <x>610</x>
+     <y>160</y>
+     <width>93</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="mouseTracking">
+    <bool>false</bool>
+   </property>
+   <property name="text">
+    <string>低轉速</string>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton_4">
+   <property name="geometry">
+    <rect>
+     <x>840</x>
+     <y>160</y>
+     <width>93</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string>高轉速</string>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton_5">
+   <property name="geometry">
+    <rect>
+     <x>730</x>
+     <y>250</y>
+     <width>93</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string>吐料</string>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton_6">
+   <property name="geometry">
+    <rect>
+     <x>730</x>
+     <y>70</y>
+     <width>93</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string>進料</string>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Left_rotation_val">
+   <property name="geometry">
+    <rect>
+     <x>200</x>
+     <y>50</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Right_rotation_val">
+   <property name="geometry">
+    <rect>
+     <x>490</x>
+     <y>50</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Move_X_val">
+   <property name="geometry">
+    <rect>
+     <x>10</x>
+     <y>440</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Move_Y_val">
+   <property name="geometry">
+    <rect>
+     <x>190</x>
+     <y>520</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Aim_X_val">
+   <property name="geometry">
+    <rect>
+     <x>300</x>
+     <y>440</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Aim_Y_val">
+   <property name="geometry">
+    <rect>
+     <x>470</x>
+     <y>520</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
+
+================================================================================
+FILE: XboxGUI_V2.ui
+================================================================================
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>Form</class>
+ <widget class="QWidget" name="Form">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>953</width>
+    <height>560</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Xbox Controller GUI</string>
+  </property>
+  <property name="styleSheet">
+   <string>/* ===== 主背景 ===== */
+QWidget {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #212d7aff, stop:0.5 #000001, stop:1 #000000);
+}
+
+/* ===== 水平滑桿 ===== */
+QSlider::groove:horizontal {
+    border: 1px solid #ffffffff;
+    height: 10px;
+    background: #0a0a0a;
+    border-radius: 5px;
+}
+QSlider::handle:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #16d946, stop:1 #0aa62c);
+    border: 2px solid #ffffffff;
+    width: 18px;
+    margin: -5px 0;
+    border-radius: 9px;
+}
+QSlider::handle:horizontal:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2dc759, stop:1 #16d946);
+    border: 2px solid #16d946;
+}
+
+/* ===== 垂直滑桿 ===== */
+QSlider::groove:vertical {
+    border: 1px solid #ffffffff;
+    width: 10px;
+    background: #0a0a0a;
+    border-radius: 5px;
+}
+QSlider::handle:vertical {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #16d946, stop:1 #0aa62c);
+    border: 2px solid #ffffffff;
+    height: 18px;
+    margin: 0 -5px;
+    border-radius: 9px;
+}
+QSlider::handle:vertical:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2dc759, stop:1 #16d946);
+    border: 2px solid #16d946;
+}
+
+/* ===== 標籤 ===== */
+QLabel {
+    color: #16d946;
+    font-weight: bold;
+    font-size: 11px;
+}
+
+/* ===== LCD 數字顯示 ===== */
+QLCDNumber {
+    background: #0a0a0a;
+    color: #16d946;
+    border: 2px solid #ffffffff;
+    border-radius: 4px;
+    font-weight: bold;
+}</string>
+  </property>
+  <widget class="QSlider" name="Move_X">
+   <property name="geometry">
+    <rect>
+     <x>80</x>
+     <y>420</y>
+     <width>160</width>
+     <height>22</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Orientation::Horizontal</enum>
+   </property>
+  </widget>
+  <widget class="QSlider" name="Move_Y">
+   <property name="geometry">
+    <rect>
+     <x>150</x>
+     <y>350</y>
+     <width>22</width>
+     <height>160</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Orientation::Vertical</enum>
+   </property>
+  </widget>
+  <widget class="QSlider" name="Left_rotation">
+   <property name="geometry">
+    <rect>
+     <x>150</x>
+     <y>70</y>
+     <width>22</width>
+     <height>160</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Orientation::Vertical</enum>
+   </property>
+  </widget>
+  <widget class="QSlider" name="Right_rotation">
+   <property name="geometry">
+    <rect>
+     <x>440</x>
+     <y>70</y>
+     <width>22</width>
+     <height>160</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Orientation::Vertical</enum>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton">
+   <property name="geometry">
+    <rect>
+     <x>100</x>
+     <y>240</y>
+     <width>131</width>
+     <height>41</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>Coburn</family>
+     <pointsize>12</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="styleSheet">
+    <string>/* Aim_X lock - 紅色系 */
+QPushButton {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #f69797ff, stop:1 #e81828);
+    border: 2px solid #ff4444;
+    color: #ffffff;
+    border-radius: 6px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ff7777, stop:1 #f69797ff);
+    border: 2px solid #ffaaaa;
+}
+QPushButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #c40c0c, stop:1 #a00808);
+    border: 2px solid #ff0000;
+}</string>
+   </property>
+   <property name="text">
+    <string>Aim_X lock</string>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton_2">
+   <property name="geometry">
+    <rect>
+     <x>380</x>
+     <y>240</y>
+     <width>141</width>
+     <height>41</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>Coburn</family>
+     <pointsize>12</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="styleSheet">
+    <string>/* Aim_Y lock - 紅色系 */
+QPushButton {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #f69797ff, stop:1 #e81828);
+    border: 2px solid #ff4444;
+    color: #ffffff;
+    border-radius: 6px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ff7777, stop:1 #f69797ff);
+    border: 2px solid #ffaaaa;
+}
+QPushButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #c40c0c, stop:1 #a00808);
+    border: 2px solid #ff0000;
+}</string>
+   </property>
+   <property name="text">
+    <string>Aim_Y lock</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label">
+   <property name="geometry">
+    <rect>
+     <x>120</x>
+     <y>50</y>
+     <width>71</width>
+     <height>16</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>Coburn</family>
+     <pointsize>-1</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="text">
+    <string>Left rotation</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label_2">
+   <property name="geometry">
+    <rect>
+     <x>410</x>
+     <y>50</y>
+     <width>81</width>
+     <height>20</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>Coburn</family>
+     <pointsize>-1</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="text">
+    <string>Right rotation</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label_3">
+   <property name="geometry">
+    <rect>
+     <x>130</x>
+     <y>520</y>
+     <width>51</width>
+     <height>16</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>Coburn</family>
+     <pointsize>-1</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="text">
+    <string>Move_Y</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label_4">
+   <property name="geometry">
+    <rect>
+     <x>20</x>
+     <y>420</y>
+     <width>51</width>
+     <height>16</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>Coburn</family>
+     <pointsize>-1</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="text">
+    <string>Move_X</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label_5">
+   <property name="geometry">
+    <rect>
+     <x>420</x>
+     <y>520</y>
+     <width>51</width>
+     <height>16</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>Coburn</family>
+     <pointsize>-1</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="text">
+    <string>Aim_Y</string>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label_6">
+   <property name="geometry">
+    <rect>
+     <x>310</x>
+     <y>420</y>
+     <width>51</width>
+     <height>16</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>Coburn</family>
+     <pointsize>-1</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="text">
+    <string>Aim_X</string>
+   </property>
+  </widget>
+  <widget class="QSlider" name="Aim_X">
+   <property name="geometry">
+    <rect>
+     <x>370</x>
+     <y>420</y>
+     <width>160</width>
+     <height>22</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Orientation::Horizontal</enum>
+   </property>
+  </widget>
+  <widget class="QSlider" name="Aim_Y">
+   <property name="geometry">
+    <rect>
+     <x>440</x>
+     <y>350</y>
+     <width>22</width>
+     <height>160</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Orientation::Vertical</enum>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton_3">
+   <property name="geometry">
+    <rect>
+     <x>610</x>
+     <y>160</y>
+     <width>93</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>標楷體</family>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="mouseTracking">
+    <bool>true</bool>
+   </property>
+   <property name="styleSheet">
+    <string>/* 低轉速 - 綠色系（補給類） */
+QPushButton {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #22dd55, stop:1 #16d946);
+    border: 2px solid #16d946;
+    color: #ffffff;
+    border-radius: 6px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2dc759, stop:1 #22dd55);
+    border: 2px solid #2dc759;
+}
+QPushButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0d5a0d, stop:1 #0a450a);
+    border: 2px solid #ffffffff;
+}</string>
+   </property>
+   <property name="text">
+    <string>低轉速</string>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton_4">
+   <property name="geometry">
+    <rect>
+     <x>840</x>
+     <y>160</y>
+     <width>93</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>標楷體</family>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="styleSheet">
+    <string>/* 高轉速 - 黃色系（動力類） */
+QPushButton {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffee22, stop:1 #ffc400);
+    border: 2px solid #ffff00;
+    color: #000000;
+    border-radius: 6px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffff44, stop:1 #ffee22);
+    border: 2px solid #ffff88;
+}
+QPushButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ff9d00, stop:1 #ff8800);
+    border: 2px solid #ff6600;
+}</string>
+   </property>
+   <property name="text">
+    <string>高轉速</string>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton_5">
+   <property name="geometry">
+    <rect>
+     <x>730</x>
+     <y>250</y>
+     <width>93</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>標楷體</family>
+     <pointsize>10</pointsize>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="styleSheet">
+    <string>/* 退彈 - 藍色系（發射類） */
+QPushButton {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0088ff, stop:1 #0066cc);
+    border: 2px solid #0066cc;
+    color: #ffffff;
+    border-radius: 6px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #33aaff, stop:1 #0088ff);
+    border: 2px solid #33aaff;
+}
+QPushButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #000aa6, stop:1 #000578);
+    border: 2px solid #0033ff;
+}</string>
+   </property>
+   <property name="text">
+    <string>退彈</string>
+   </property>
+  </widget>
+  <widget class="QPushButton" name="pushButton_6">
+   <property name="geometry">
+    <rect>
+     <x>730</x>
+     <y>70</y>
+     <width>93</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="font">
+    <font>
+     <family>標楷體</family>
+     <bold>true</bold>
+    </font>
+   </property>
+   <property name="styleSheet">
+    <string>/* 進彈 - 藍綠色系（提示不同功能） */
+QPushButton {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #00dd99, stop:1 #00b388);
+    border: 2px solid #00cc88;
+    color: #ffffff;
+    border-radius: 6px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #00ffaa, stop:1 #00dd99);
+    border: 2px solid #00ffaa;
+}
+QPushButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #008866, stop:1 #005544);
+    border: 2px solid #009977;
+}</string>
+   </property>
+   <property name="text">
+    <string>進彈</string>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Left_rotation_val">
+   <property name="geometry">
+    <rect>
+     <x>200</x>
+     <y>50</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Right_rotation_val">
+   <property name="geometry">
+    <rect>
+     <x>490</x>
+     <y>50</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Move_X_val">
+   <property name="geometry">
+    <rect>
+     <x>10</x>
+     <y>440</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Move_Y_val">
+   <property name="geometry">
+    <rect>
+     <x>190</x>
+     <y>520</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Aim_X_val">
+   <property name="geometry">
+    <rect>
+     <x>300</x>
+     <y>440</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QLCDNumber" name="Aim_Y_val">
+   <property name="geometry">
+    <rect>
+     <x>470</x>
+     <y>520</y>
+     <width>64</width>
+     <height>23</height>
+    </rect>
+   </property>
+  </widget>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
+
+================================================================================
+FILE: aim\aim.ino
+================================================================================
+/*******************************************************
+ * Arduino：雙軸步進（只支援 1,角度 / 2,角度）
+ * M1: 42667 步/圈
+ * M2: 57600 步/圈
+ * 範例：1,45.0   或   2,90
+ *******************************************************/
+#include <Arduino.h>
+
+struct StepperAxis {
+  int PUL, DIR, ENA;
+  bool DIR_INVERT;        // true=反向（若方向顛倒，改這個）
+  bool ENA_ACTIVE_HIGH;   // true=HIGH為使能
+  float currentAngle;     // 目前角度(度)
+  long stepsPerRev;       // 每圈步數(含細分/減速)
+  int speed_us;           // 半脈衝延遲(μs)，越小越快
+};
+
+// === 腳位（依你前兩份程式） ===
+const int M1_PUL = 13, M1_DIR = 12, M1_ENA = 11;  // 軸1
+const int M2_PUL = 10, M2_DIR = 9,  M2_ENA = 8;   // 軸2
+
+// === 每圈步數（已依你提供設定） ===
+const long M1_STEPS_PER_REV = 42667L;
+const long M2_STEPS_PER_REV = 57600L;
+
+// === 參數 ===
+StepperAxis m1 = { M1_PUL, M1_DIR, M1_ENA, true,  true, 0.0, M1_STEPS_PER_REV, 25 };
+StepperAxis m2 = { M2_PUL, M2_DIR, M2_ENA, true,  true, 0.0, M2_STEPS_PER_REV, 25 };
+
+static inline void holdEnable(const StepperAxis& ax, bool on) {
+  digitalWrite(ax.ENA, on ? (ax.ENA_ACTIVE_HIGH ? HIGH : LOW)
+                          : (ax.ENA_ACTIVE_HIGH ? LOW  : HIGH));
+}
+
+void setupAxis(const StepperAxis& ax) {
+  pinMode(ax.PUL, OUTPUT);
+  pinMode(ax.DIR, OUTPUT);
+  pinMode(ax.ENA, OUTPUT);
+  holdEnable(ax, true); // 使能保持鎖住
+}
+
+void setup() {
+  Serial.begin(115200);
+  setupAxis(m1);
+  setupAxis(m2);
+  Serial.println(F("就緒：只接受 1,角度 或 2,角度"));
+  Serial.println(F("M1=42667 步/圈, M2=57600 步/圈"));
+}
+
+void loop() {
+  if (!Serial.available()) return;
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  if (!cmd.length()) return;
+
+  int comma = cmd.indexOf(',');
+  if (comma <= 0) {
+    Serial.println(F("❌ 格式錯誤：請輸入 1,角度 或 2,角度"));
+    return;
+  }
+
+  int axisId = cmd.substring(0, comma).toInt();
+  float targetAngle = cmd.substring(comma + 1).toFloat();
+
+  if (axisId == 1) {
+    moveToAngle(m1, targetAngle);
+    Serial.println(F("M1 OK"));
+  } else if (axisId == 2) {
+    moveToAngle(m2, targetAngle);
+    Serial.println(F("M2 OK"));
+  } else {
+    Serial.println(F("❌ 馬達編號只接受 1 或 2"));
+  }
+}
+
+void moveToAngle(StepperAxis& ax, float targetAngle) {
+  float diff = targetAngle - ax.currentAngle;
+  // 自行四捨五入以避免 lround 帶來的額外體積
+  long stepsToMove = (long)(fabs(diff) * ((double)ax.stepsPerRev / 360.0) + 0.5);
+  if (stepsToMove <= 0) { ax.currentAngle = targetAngle; return; }
+
+  bool dirLogical = (diff >= 0);
+  if (ax.DIR_INVERT) dirLogical = !dirLogical;
+  digitalWrite(ax.DIR, dirLogical ? HIGH : LOW);
+
+  holdEnable(ax, true); // 確保保持
+
+  for (long i = 0; i < stepsToMove; i++) {
+    digitalWrite(ax.PUL, HIGH);
+    delayMicroseconds(ax.speed_us);
+    digitalWrite(ax.PUL, LOW);
+    delayMicroseconds(ax.speed_us);
+  }
+  ax.currentAngle = targetAngle;
+}
+
+================================================================================
+FILE: chassis_shooter\chassis_shooter.ino
+================================================================================
+// Mega_Mux_NoToken.ino
+// 單一韌體，板上分流兩種模式以降低負荷：
+//   模式 CHASSIS：只跑麥輪底盤（vx,vy,wz）
+//   模式 SHOOTER：只跑 NEO + 步進（整數 -100..100, F/R/S）
+//
+// 串列指令 (無 TOKEN；相容舊有 <11323310> 前綴會自動剝除) ：
+//   MODE CHASSIS          切換到底盤模式（並關閉發射模組）
+//   MODE SHOOTER          切換到發射模式（並關閉底盤）
+//   STATUS                顯示目前模式與該模式的狀態
+//   STOP                  依模式停當前子系統：CHASSIS 停車；SHOOTER 停步進+NEO=0
+//   vx,vy,wz              僅 CHASSIS 模式有效 (範圍建議 -1..1)
+//   F / R / S             僅 SHOOTER 模式有效（步進 前/反/停(抱死)）
+//   -100..100             僅 SHOOTER 模式有效（NEO 速度）
+//
+// 降負荷重點：
+//  - 僅在 CHASSIS 模式執行 rampUpdateAndApply() 與底盤 telemetry
+//  - 僅在 SHOOTER 模式執行 serviceStepper()（步進脈衝）與 NEO Servo（attach）
+//  - 切到 CHASSIS 會 detach Servo（釋放計時器中斷），步進 ENA=HIGH（抱死、停脈衝）
+//  - 切到 SHOOTER 會 stopAll() 關閉所有底盤 PWM
+//  - Telemetry 僅輸出當前模式的必要資訊
+
+#include <Arduino.h>
+#include <math.h>
+#include <Servo.h>
+
+// ================== 模式定義 ==================
+enum Mode { MODE_CHASSIS = 0, MODE_SHOOTER = 1 };
+volatile Mode g_mode = MODE_CHASSIS;
+
+// ================== CHASSIS（麥輪） ==================
+// Pins (MEGA)
+const uint8_t M1_PWM_A_PIN = 2;  // 前左 index 0
+const uint8_t M1_PWM_B_PIN = 3;
+const uint8_t M2_PWM_A_PIN = 4;  // 左後 index 1
+const uint8_t M2_PWM_B_PIN = 5;
+const uint8_t M3_PWM_A_PIN = 7;  // 右前 index 2
+const uint8_t M3_PWM_B_PIN = 6;
+const uint8_t M4_PWM_A_PIN = 8;  // 右後 index 3
+const uint8_t M4_PWM_B_PIN = 9;
+
+const int   MIN_PWM   = 80;
+const int   MAX_PWM   = 255;
+const float RAMP_STEP = 6.0;
+const float DEAD_BAND = 0.02;
+const float K_OMEGA   = 0.5;
+
+float currentPWMvals[4] = {0,0,0,0};
+float targetPWMvals[4]  = {0,0,0,0};
+bool  motorActive       = false;
+
+// ================== SHOOTER（NEO + 步進） ==================
+Servo sparkMax;
+const int SPARK_PWM_PIN = 13;     // NEO (Spark MAX) PWM
+bool servoAttached = false;
+int  neoSpeed = 0;                // -100..100（僅作狀態記錄）
+
+const int PUL = 53;
+const int DIR = 52;
+const int ENA = 51;
+const unsigned int PULSE_US = 25;
+
+enum StepState { STEP_STOP=0, STEP_FWD, STEP_REV };
+volatile StepState stepState = STEP_STOP;
+unsigned long lastToggleMicros = 0;
+bool pulseLevel = false;
+
+// ================== 共用 ==================
+String serialBuf = "";
+unsigned long lastTelemetryMs = 0;
+const unsigned long TELE_CHASSIS_MS = 200UL;
+const unsigned long TELE_SHOOTER_MS = 400UL; // 發射端資訊較少，頻率可放慢
+unsigned long lastTeleBudgetMs = 0;
+
+bool equalsIgnoreCase(const String& a, const char* b) {
+  String t=a; t.toUpperCase(); String u=String(b); u.toUpperCase(); return t==u;
+}
+
+// ------------------ CHASSIS 函式 ------------------
+void stopAllChassis() {
+  analogWrite(M1_PWM_A_PIN,0); analogWrite(M1_PWM_B_PIN,0);
+  analogWrite(M2_PWM_A_PIN,0); analogWrite(M2_PWM_B_PIN,0);
+  analogWrite(M3_PWM_A_PIN,0); analogWrite(M3_PWM_B_PIN,0);
+  analogWrite(M4_PWM_A_PIN,0); analogWrite(M4_PWM_B_PIN,0);
+  for (int i=0;i<4;i++){ currentPWMvals[i]=0; targetPWMvals[i]=0; }
+  motorActive=false;
+  Serial.println("🛑 CHASSIS stop");
+}
+
+void applyMotorDirect(int idx, int pwm_abs, bool forward) {
+  switch(idx){
+    case 0: if(forward){ analogWrite(M1_PWM_A_PIN,pwm_abs); analogWrite(M1_PWM_B_PIN,0);} else { analogWrite(M1_PWM_A_PIN,0); analogWrite(M1_PWM_B_PIN,pwm_abs);} break;
+    case 1: if(forward){ analogWrite(M2_PWM_A_PIN,pwm_abs); analogWrite(M2_PWM_B_PIN,0);} else { analogWrite(M2_PWM_A_PIN,0); analogWrite(M2_PWM_B_PIN,pwm_abs);} break;
+    case 2: if(forward){ analogWrite(M3_PWM_A_PIN,pwm_abs); analogWrite(M3_PWM_B_PIN,0);} else { analogWrite(M3_PWM_A_PIN,0); analogWrite(M3_PWM_B_PIN,pwm_abs);} break;
+    case 3: if(forward){ analogWrite(M4_PWM_A_PIN,pwm_abs); analogWrite(M4_PWM_B_PIN,0);} else { analogWrite(M4_PWM_A_PIN,0); analogWrite(M4_PWM_B_PIN,pwm_abs);} break;
+  }
+}
+
+void applyWheelCommand(float w0,float w1,float w2,float w3){
+  float a[4]={w0,w1,w2,w3}; float maxv=0.0001f;
+  // 固定反向（依你的接線）：前左、右前反向
+  a[0]=-a[0]; a[2]=-a[2];
+  for(int i=0;i<4;i++){ if(fabs(a[i])<DEAD_BAND) a[i]=0; if(fabs(a[i])>maxv) maxv=fabs(a[i]); }
+  if(maxv>1.0f) for(int i=0;i<4;i++) a[i]/=maxv;
+  for(int i=0;i<4;i++){
+    float mag=fabs(a[i]);
+    if(mag<DEAD_BAND) targetPWMvals[i]=0;
+    else {
+      float pwm=MIN_PWM+(MAX_PWM-MIN_PWM)*mag;
+      targetPWMvals[i]=(a[i]>=0)?pwm:-pwm;
+    }
+  }
+  motorActive=true;
+}
+
+void rampUpdateAndApply(){
+  if (g_mode != MODE_CHASSIS) return; // 非底盤模式，不做任何 PWM 更新
+  for(int i=0;i<4;i++){
+    float cur=currentPWMvals[i], tgt=targetPWMvals[i];
+    if (fabs(tgt-cur)<=RAMP_STEP) cur=tgt; else cur += (tgt>cur)?RAMP_STEP:-RAMP_STEP;
+    currentPWMvals[i]=cur;
+    if (fabs(cur)<1.0){
+      switch(i){
+        case 0: analogWrite(M1_PWM_A_PIN,0); analogWrite(M1_PWM_B_PIN,0); break;
+        case 1: analogWrite(M2_PWM_A_PIN,0); analogWrite(M2_PWM_B_PIN,0); break;
+        case 2: analogWrite(M3_PWM_A_PIN,0); analogWrite(M3_PWM_B_PIN,0); break;
+        case 3: analogWrite(M4_PWM_A_PIN,0); analogWrite(M4_PWM_B_PIN,0); break;
+      }
+    }else{
+      applyMotorDirect(i,(int)fabs(cur),(cur>0));
+    }
+  }
+}
+
+void mecanum_from_cmd(float vx,float vy,float wz,float out[4]){
+  // 機體朝向補償：等效順時針 +90° → (vx_r,vy_r)=(-vy, vx)
+  float vx_r=-vy, vy_r=vx;
+  float wFL=vx_r - vy_r - K_OMEGA*wz;
+  float wFR=vx_r + vy_r + K_OMEGA*wz;
+  float wRL=vx_r + vy_r - K_OMEGA*wz;
+  float wRR=vx_r - vy_r + K_OMEGA*wz;
+  float m=max(max(fabs(wFL),fabs(wFR)),max(fabs(wRL),fabs(wRR)));
+  if(m>1.0f){ wFL/=m; wFR/=m; wRL/=m; wRR/=m; }
+  out[0]=wFL; out[1]=wFR; out[2]=wRL; out[3]=wRR;
+}
+
+// ------------------ SHOOTER 函式 ------------------
+void ensureServo(bool wantAttach){
+  if (wantAttach && !servoAttached){
+    sparkMax.attach(SPARK_PWM_PIN);
+    servoAttached = true;
+  } else if (!wantAttach && servoAttached){
+    sparkMax.detach();
+    servoAttached = false;
+  }
+}
+
+void setSparkSpeed(int speed){
+  neoSpeed = speed;
+  if (!servoAttached) return; // 非 SHOOTER 模式時不送脈衝
+  int us = map(speed, -100, 100, 1000, 2000);
+  sparkMax.writeMicroseconds(us);
+  Serial.print("NEO="); Serial.print(speed);
+  Serial.print(" pwm(us)="); Serial.println(us);
+}
+
+void startForward(){ digitalWrite(DIR,HIGH); stepState=STEP_FWD; Serial.println("STEP=F"); }
+void startReverse(){ digitalWrite(DIR,LOW);  stepState=STEP_REV; Serial.println("STEP=R"); }
+void stopStepper(){ stepState=STEP_STOP; pulseLevel=false; digitalWrite(PUL,LOW); digitalWrite(ENA,HIGH); Serial.println("STEP=S (hold)"); }
+
+void serviceStepper(){
+  if (g_mode != MODE_SHOOTER) return;           // 非發射模式，不產生脈衝
+  if (stepState == STEP_STOP) return;           // 停止狀態不占用 CPU
+  unsigned long now=micros();
+  if ((unsigned long)(now - lastToggleMicros) >= PULSE_US){
+    pulseLevel=!pulseLevel;
+    digitalWrite(PUL, pulseLevel?HIGH:LOW);
+    lastToggleMicros=now;
+  }
+}
+
+// ------------------ Telemetry ------------------
+void tele_chassis(){
+  Serial.print("TELE-CH: cur[");
+  for(int i=0;i<4;i++){ if(i) Serial.print(","); Serial.print(currentPWMvals[i],1); }
+  Serial.print("] tgt[");
+  for(int i=0;i<4;i++){ if(i) Serial.print(","); Serial.print(targetPWMvals[i],1); }
+  Serial.println("]");
+}
+void tele_shooter(){
+  Serial.print("TELE-SH: NEO="); Serial.print(neoSpeed);
+  Serial.print(" STEP=");
+  Serial.println(stepState==STEP_STOP?"STOP":(stepState==STEP_FWD?"FWD":"REV"));
+}
+
+// ------------------ 模式切換 ------------------
+void enterChassisMode(){
+  // 關閉發射子系統
+  stopStepper();                 // ENA=HIGH 抱死
+  ensureServo(false);            // detach Servo，釋放計時器中斷
+  setSparkSpeed(0);              // 更新邏輯值，實際輸出因已 detach 不會送
+  // 底盤安全歸零
+  stopAllChassis();
+  g_mode = MODE_CHASSIS;
+  lastTelemetryMs = millis();
+  Serial.println(">> MODE=CHASSIS");
+}
+
+void enterShooterMode(){
+  // 關閉底盤輸出
+  stopAllChassis();
+  // 啟動發射子系統
+  ensureServo(true);             // attach Servo
+  digitalWrite(ENA,HIGH);        // 上電預設抱死
+  g_mode = MODE_SHOOTER;
+  lastTelemetryMs = millis();
+  Serial.println(">> MODE=SHOOTER");
+}
+
+// ------------------ 狀態印出 ------------------
+void print_status(){
+  Serial.println("=== STATUS ===");
+  Serial.print("MODE: "); Serial.println(g_mode==MODE_CHASSIS?"CHASSIS":"SHOOTER");
+  if (g_mode==MODE_CHASSIS){
+    Serial.print("motorActive: "); Serial.println(motorActive?"YES":"NO");
+    for (int i=0;i<4;i++){
+      Serial.print("cur[");Serial.print(i);Serial.print("]=");Serial.print(currentPWMvals[i],1);
+      Serial.print(" tgt[");Serial.print(i);Serial.print("]=");Serial.println(targetPWMvals[i],1);
+    }
+  } else {
+    Serial.print("NEO speed: "); Serial.println(neoSpeed);
+    Serial.print("STEP state: "); Serial.println(stepState==STEP_STOP?"STOP":(stepState==STEP_FWD?"FWD":"REV"));
+  }
+  Serial.println("=============");
+}
+
+// ------------------ 指令處理 ------------------
+void process_cmd_vel(String &msg){
+  // 僅 CHASSIS 模式有效
+  if (g_mode != MODE_CHASSIS) { Serial.println("IGNORED: vx,vy,wz (MODE!=CHASSIS)"); return; }
+  char buf[128]; msg.toCharArray(buf,sizeof(buf));
+  char *p=strtok(buf,","); float vx=0,vy=0,wz=0;
+  if(p) vx=atof(p);
+  p=strtok(NULL,","); if(p) vy=atof(p);
+  p=strtok(NULL,","); if(p) wz=atof(p);
+  float out[4]; mecanum_from_cmd(vx,vy,wz,out); applyWheelCommand(out[0],out[1],out[2],out[3]);
+}
+
+void handle_line(String line){
+  line.trim();
+  if (!line.length()) return;
+
+  // 相容舊 TOKEN：若前綴 <11323310>，剝掉
+  const String LEGACY = "<11323310>";
+  if (line.startsWith(LEGACY)) { line = line.substring(LEGACY.length()); line.trim(); }
+
+  // 模式切換
+  if (line.equalsIgnoreCase("MODE CHASSIS")) { enterChassisMode(); return; }
+  if (line.equalsIgnoreCase("MODE SHOOTER")) { enterShooterMode(); return; }
+
+  // 通用
+  if (line.equalsIgnoreCase("STATUS")) { print_status(); return; }
+  if (line.equalsIgnoreCase("STOP")) {
+    if (g_mode==MODE_CHASSIS) stopAllChassis();
+    else { stopStepper(); setSparkSpeed(0); if (servoAttached) sparkMax.writeMicroseconds(1500); }
+    Serial.println("🛑 STOP (current mode)");
+    return;
+  }
+
+  // 依模式解譯
+  if (g_mode==MODE_CHASSIS){
+    // 只處理 vx,vy,wz
+    if (line.indexOf(',')>=0) { process_cmd_vel(line); return; }
+    Serial.println("IGNORED (CHASSIS): not vx,vy,wz");
+    return;
+  } else {
+    // SHOOTER：F/R/S / 整數
+    if (equalsIgnoreCase(line,"F")) { startForward(); return; }
+    if (equalsIgnoreCase(line,"R")) { startReverse(); return; }
+    if (equalsIgnoreCase(line,"S")) { stopStepper();  return; }
+    // 其餘視為 NEO 速度
+    long spd = line.toInt();
+    if (spd>100) spd=100; if (spd<-100) spd=-100;
+    setSparkSpeed((int)spd);
+    return;
+  }
+}
+
+// ================== setup / loop ==================
+void setup(){
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n=== MEGA Multiplex (CHASSIS / SHOOTER) NoToken ===");
+
+  // 底盤腳位
+  pinMode(M1_PWM_A_PIN, OUTPUT); pinMode(M1_PWM_B_PIN, OUTPUT);
+  pinMode(M2_PWM_A_PIN, OUTPUT); pinMode(M2_PWM_B_PIN, OUTPUT);
+  pinMode(M3_PWM_A_PIN, OUTPUT); pinMode(M3_PWM_B_PIN, OUTPUT);
+  pinMode(M4_PWM_A_PIN, OUTPUT); pinMode(M4_PWM_B_PIN, OUTPUT);
+
+  // 步進腳位
+  pinMode(PUL,OUTPUT); pinMode(DIR,OUTPUT); pinMode(ENA,OUTPUT);
+  digitalWrite(PUL,LOW); digitalWrite(ENA,HIGH); // 先抱死
+
+  // 初始進 CHASSIS，並確保發射子系統關閉
+  ensureServo(false);
+  enterChassisMode();
+
+  Serial.println("用法：MODE CHASSIS / MODE SHOOTER / STATUS / STOP / vx,vy,wz / F/R/S / -100..100");
+}
+
+void loop(){
+  // 只跑當前模式的服務
+  if (g_mode==MODE_CHASSIS){
+    // 無需處理步進；NEO Servo 已 detach
+  } else {
+    // 發射模式：處理步進脈衝
+    serviceStepper();
+  }
+
+  // 收指令（\n 為一行）
+  while (Serial.available()){
+    char c=(char)Serial.read(); if (c=='\r') continue;
+    if (c=='\n'){ String line=serialBuf; serialBuf=""; handle_line(line); }
+    else {
+      serialBuf += c;
+      if (serialBuf.length()>200) serialBuf=serialBuf.substring(serialBuf.length()-200);
+    }
+  }
+
+  // 僅在 CHASSIS 模式更新 PWM
+  if (g_mode==MODE_CHASSIS) rampUpdateAndApply();
+
+  // Telemetry（各模式各自頻率）
+  unsigned long now = millis();
+  if (g_mode==MODE_CHASSIS){
+    if (now - lastTelemetryMs >= TELE_CHASSIS_MS){ lastTelemetryMs = now; tele_chassis(); }
+  } else {
+    if (now - lastTelemetryMs >= TELE_SHOOTER_MS){ lastTelemetryMs = now; tele_shooter(); }
+  }
+}
