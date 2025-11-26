@@ -1,0 +1,14 @@
+tel2025
+└─ ALL_TEXTS.txt
+└─ Miniforge3-Linux-aarch64.sh
+└─ Miniforge3-Linux-aarch64.sh.1
+└─ aim.py
+└─ best.onnx
+└─ best.pt
+└─ files_content.jsonl
+└─ files_report.csv
+└─ files_tree.txt
+└─ mega1_controller.py
+└─ pi_detect.py
+└─ pi_remote_server.py
+└─ scan_folder.py
