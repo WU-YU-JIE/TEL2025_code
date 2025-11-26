@@ -13,10 +13,9 @@ SKIP_DIRS = {
 
 # 當作文字檔處理（小寫副檔名）
 TEXT_EXTS = {
-    ".py"
-    #,".c",".cpp",".h",".hpp",".java",".js",".ts",".sh",".bat",".ps1",".ino",
-    #".go",".rb",".php",".swift",".kt",".m",".cs",".json",".yml",".yaml",".toml",
-    #".ini",".md",".txt",".csv",".xml",".html",".css"
+    ".py",".c",".cpp",".h",".hpp",".java",".js",".ts",".sh",".bat",".ps1",".ino",
+    ".go",".rb",".php",".swift",".kt",".m",".cs",".json",".yml",".yaml",".toml",
+    ".ini",".md",".txt",".csv",".xml",".html",".css"
 }
 
 # 內容輸出控制

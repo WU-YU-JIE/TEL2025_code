@@ -90,7 +90,7 @@ void stopAllChassis() {
   analogWrite(M4_PWM_A_PIN,0); analogWrite(M4_PWM_B_PIN,0);
   for (int i=0;i<4;i++){ currentPWMvals[i]=0; targetPWMvals[i]=0; }
   motorActive=false;
-  Serial.println("🛑 CHASSIS stop");
+  Serial.println("CHASSIS stop");
 }
 
 void applyMotorDirect(int idx, int pwm_abs, bool forward) {
@@ -269,7 +269,7 @@ void handle_line(String line){
   if (line.equalsIgnoreCase("STOP")) {
     if (g_mode==MODE_CHASSIS) stopAllChassis();
     else { stopStepper(); setSparkSpeed(0); if (servoAttached) sparkMax.writeMicroseconds(1500); }
-    Serial.println("🛑 STOP (current mode)");
+    Serial.println("STOP (current mode)");
     return;
   }
 
@@ -323,7 +323,7 @@ void setup(){
   servoAngle.attach(servo);   // 或直接寫 10
   servoAngle.write(90);       // 預設 90 度
 
-  Serial.println("用法：MODE CHASSIS / MODE SHOOTER / STATUS / STOP / vx,vy,wz / F/R/S / S1/S2/S3 / -100..100");
+  Serial.println("usage：MODE CHASSIS / MODE SHOOTER / STATUS / STOP / vx,vy,wz / F/R/S / S1/S2/S3 / -100..100");
 }
 
 void loop(){
