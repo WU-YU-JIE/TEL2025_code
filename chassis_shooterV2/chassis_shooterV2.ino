@@ -1,49 +1,50 @@
 // chassis_shooter.ino
-// 單一韌體，板上分流兩種模式以降低負荷：
-//   模式 CHASSIS：只跑麥輪底盤（vx,vy,wz）
-//   模式 SHOOTER：只跑 NEO + 步進（整數 -100..100, F/R/S）
+// 單一韌體：麥輪底盤 + 遙控器混控 (RC Mix) / 發射機構
 //
-// 串列指令 (無 TOKEN；相容舊有 <11323310> 前綴會自動剝除) ：
-//   MODE CHASSIS          切換到底盤模式（並關閉發射模組）
-//   MODE SHOOTER          切換到發射模式（並關閉底盤）
-//   STATUS                顯示目前模式與該模式的狀態
-//   STOP                  依模式停當前子系統：CHASSIS 停車；SHOOTER 停步進+NEO=0
-//   vx,vy,wz              僅 CHASSIS 模式有效 (範圍建議 -1..1)
-//   F / R / S             僅 SHOOTER 模式有效（步進 前/反/停(抱死)）
-//   -100..100             僅 SHOOTER 模式有效（NEO 速度）
+// [RC 連線配置] Arduino MEGA 腳位：
+//   - Pin 10 <--> 接收機 CH3 (控制 vx 前後)
+//   - Pin 11 <--> 接收機 CH4 (控制 vy 左右)
+//   - Pin 12 <--> 接收機 CH5 (控制 wz 旋轉)
 //
-// 新增：
-//   S1 / S2 / S3          僅 SHOOTER 模式有效（pin10 Servo 轉到 60 / 90 / 120 度）
-//
-// 降負荷重點：
-//  - 僅在 CHASSIS 模式執行 rampUpdateAndApply() 與底盤 telemetry
-//  - 僅在 SHOOTER 模式執行 serviceStepper()（步進脈衝）與 NEO Servo（attach）
-//  - 切到 CHASSIS 會 detach Servo（釋放計時器中斷），步進 ENA=HIGH（抱死、停脈衝）
-//  - 切到 SHOOTER 會 stopAll() 關閉所有底盤 PWM
-//  - Telemetry 僅輸出當前模式的必要資訊
+// [RC 數值校正]
+//   - 範圍: 1056 ~ 1916
+//   - 中點: 1486 (實測 1484)
+//   - 邏輯: 1916=+1.0, 1056=-1.0
 
 #include <Arduino.h>
 #include <math.h>
 #include <Servo.h>
 
-// ================== 角度 Servo（pin10，新增） ==================
-Servo servoAngle;   // 專門控制 pin10 的 Servo（S1/S2/S3）
-
 // ================== 模式定義 ==================
 enum Mode { MODE_CHASSIS = 0, MODE_SHOOTER = 1 };
 volatile Mode g_mode = MODE_CHASSIS;
 
+// ================== RC 遙控器設定 (更新) ==================
+const int PIN_RC_CH3 = 10; // 對應 vx
+const int PIN_RC_CH4 = 11; // 對應 vy
+const int PIN_RC_CH5 = 12; // 對應 wz
+
+// 儲存來自 Serial 指令的速度
+float serial_vx = 0;
+float serial_vy = 0;
+float serial_wz = 0;
+
+// ★ 校正後的參數
+const int RC_MIN = 1056;
+const int RC_MAX = 1916;
+const int RC_MID = 1486;    // 數學中點
+const int RC_SWING = 430;   // 單邊擺幅
+const int RC_DEADBAND = 40; // 死區 (容許 1446~1526 為 0)
+
 // ================== CHASSIS（麥輪） ==================
-// Pins (MEGA)
-const uint8_t M1_PWM_A_PIN = 2;  // 前左 index 0
+const uint8_t M1_PWM_A_PIN = 2;  // 前左
 const uint8_t M1_PWM_B_PIN = 3;
-const uint8_t M2_PWM_A_PIN = 4;  // 左後 index 1
+const uint8_t M2_PWM_A_PIN = 4;  // 左後
 const uint8_t M2_PWM_B_PIN = 5;
-const uint8_t M3_PWM_A_PIN = 7;  // 右前 index 2
+const uint8_t M3_PWM_A_PIN = 7;  // 右前
 const uint8_t M3_PWM_B_PIN = 6;
-const uint8_t M4_PWM_A_PIN = 8;  // 右後 index 3
+const uint8_t M4_PWM_A_PIN = 8;  // 右後
 const uint8_t M4_PWM_B_PIN = 9;
-const uint8_t servo = 10;
 
 const int   MIN_PWM   = 80;
 const int   MAX_PWM   = 255;
@@ -57,9 +58,9 @@ bool  motorActive       = false;
 
 // ================== SHOOTER（NEO + 步進） ==================
 Servo sparkMax;
-const int SPARK_PWM_PIN = 13;     // NEO (Spark MAX) PWM
+const int SPARK_PWM_PIN = 13;
 bool servoAttached = false;
-int  neoSpeed = 0;                // -100..100（僅作狀態記錄）
+int  neoSpeed = 0;
 
 const int PUL = 53;
 const int DIR = 52;
@@ -75,11 +76,31 @@ bool pulseLevel = false;
 String serialBuf = "";
 unsigned long lastTelemetryMs = 0;
 const unsigned long TELE_CHASSIS_MS = 200UL;
-const unsigned long TELE_SHOOTER_MS = 400UL; // 發射端資訊較少，頻率可放慢
-unsigned long lastTeleBudgetMs = 0;
+const unsigned long TELE_SHOOTER_MS = 400UL;
 
 bool equalsIgnoreCase(const String& a, const char* b) {
   String t=a; t.toUpperCase(); String u=String(b); u.toUpperCase(); return t==u;
+}
+
+// ------------------ RC 讀取函式 ------------------
+float readRCChannel(int pin) {
+  unsigned long val = pulseIn(pin, HIGH, 25000); 
+  
+  if (val == 0) return 0.0;
+
+  // 1. 死區處理
+  if (val > (RC_MID - RC_DEADBAND) && val < (RC_MID + RC_DEADBAND)) {
+    return 0.0;
+  }
+
+  // 2. 對應到 -1.0 ~ 1.0 (使用校正後的 RC_SWING)
+  float result = (float)((long)val - RC_MID) / (float)RC_SWING; 
+  
+  // 3. 限制範圍
+  if (result > 1.0) result = 1.0;
+  if (result < -1.0) result = -1.0;
+  
+  return result;
 }
 
 // ------------------ CHASSIS 函式 ------------------
@@ -91,6 +112,7 @@ void stopAllChassis() {
   for (int i=0;i<4;i++){ currentPWMvals[i]=0; targetPWMvals[i]=0; }
   motorActive=false;
   Serial.println("CHASSIS stop");
+  serial_vx = 0; serial_vy = 0; serial_wz = 0;
 }
 
 void applyMotorDirect(int idx, int pwm_abs, bool forward) {
@@ -104,8 +126,7 @@ void applyMotorDirect(int idx, int pwm_abs, bool forward) {
 
 void applyWheelCommand(float w0,float w1,float w2,float w3){
   float a[4]={w0,w1,w2,w3}; float maxv=0.0001f;
-  // 固定反向（依你的接線）：前左、右前反向
-  a[0]=-a[0]; a[2]=-a[2];
+  a[0]=-a[0]; a[2]=-a[2]; 
   for(int i=0;i<4;i++){ if(fabs(a[i])<DEAD_BAND) a[i]=0; if(fabs(a[i])>maxv) maxv=fabs(a[i]); }
   if(maxv>1.0f) for(int i=0;i<4;i++) a[i]/=maxv;
   for(int i=0;i<4;i++){
@@ -120,7 +141,7 @@ void applyWheelCommand(float w0,float w1,float w2,float w3){
 }
 
 void rampUpdateAndApply(){
-  if (g_mode != MODE_CHASSIS) return; // 非底盤模式，不做任何 PWM 更新
+  if (g_mode != MODE_CHASSIS) return;
   for(int i=0;i<4;i++){
     float cur=currentPWMvals[i], tgt=targetPWMvals[i];
     if (fabs(tgt-cur)<=RAMP_STEP) cur=tgt; else cur += (tgt>cur)?RAMP_STEP:-RAMP_STEP;
@@ -139,7 +160,6 @@ void rampUpdateAndApply(){
 }
 
 void mecanum_from_cmd(float vx,float vy,float wz,float out[4]){
-  // 機體朝向補償：等效順時針 +90° → (vx_r,vy_r)=(-vy, vx)
   float vx_r=-vy, vy_r=vx;
   float wFL=vx_r - vy_r - K_OMEGA*wz;
   float wFR=vx_r + vy_r + K_OMEGA*wz;
@@ -163,7 +183,7 @@ void ensureServo(bool wantAttach){
 
 void setSparkSpeed(int speed){
   neoSpeed = speed;
-  if (!servoAttached) return; // 非 SHOOTER 模式時不送脈衝
+  if (!servoAttached) return;
   int us = map(speed, -100, 100, 1000, 2000);
   sparkMax.writeMicroseconds(us);
   Serial.print("NEO="); Serial.print(speed);
@@ -175,8 +195,8 @@ void startReverse(){ digitalWrite(DIR,LOW);  stepState=STEP_REV; Serial.println(
 void stopStepper(){ stepState=STEP_STOP; pulseLevel=false; digitalWrite(PUL,LOW); digitalWrite(ENA,HIGH); Serial.println("STEP=S (hold)"); }
 
 void serviceStepper(){
-  if (g_mode != MODE_SHOOTER) return;           // 非發射模式，不產生脈衝
-  if (stepState == STEP_STOP) return;           // 停止狀態不占用 CPU
+  if (g_mode != MODE_SHOOTER) return;
+  if (stepState == STEP_STOP) return;
   unsigned long now=micros();
   if ((unsigned long)(now - lastToggleMicros) >= PULSE_US){
     pulseLevel=!pulseLevel;
@@ -201,23 +221,19 @@ void tele_shooter(){
 
 // ------------------ 模式切換 ------------------
 void enterChassisMode(){
-  // 關閉發射子系統
-  stopStepper();                 // ENA=HIGH 抱死
-  ensureServo(false);            // detach Servo，釋放計時器中斷
-  setSparkSpeed(0);              // 更新邏輯值，實際輸出因已 detach 不會送
-  // 底盤安全歸零
-  stopAllChassis();
+  stopStepper();
+  ensureServo(false);
+  setSparkSpeed(0);
+  stopAllChassis(); 
   g_mode = MODE_CHASSIS;
   lastTelemetryMs = millis();
   Serial.println(">> MODE=CHASSIS");
 }
 
 void enterShooterMode(){
-  // 關閉底盤輸出
   stopAllChassis();
-  // 啟動發射子系統
-  ensureServo(true);             // attach Servo
-  digitalWrite(ENA,HIGH);        // 上電預設抱死
+  ensureServo(true);
+  digitalWrite(ENA,HIGH);
   g_mode = MODE_SHOOTER;
   lastTelemetryMs = millis();
   Serial.println(">> MODE=SHOOTER");
@@ -228,43 +244,38 @@ void print_status(){
   Serial.println("=== STATUS ===");
   Serial.print("MODE: "); Serial.println(g_mode==MODE_CHASSIS?"CHASSIS":"SHOOTER");
   if (g_mode==MODE_CHASSIS){
-    Serial.print("motorActive: "); Serial.println(motorActive?"YES":"NO");
-    for (int i=0;i<4;i++){
-      Serial.print("cur[");Serial.print(i);Serial.print("]=");Serial.print(currentPWMvals[i],1);
-      Serial.print(" tgt[");Serial.print(i);Serial.print("]=");Serial.println(targetPWMvals[i],1);
-    }
-  } else {
-    Serial.print("NEO speed: "); Serial.println(neoSpeed);
-    Serial.print("STEP state: "); Serial.println(stepState==STEP_STOP?"STOP":(stepState==STEP_FWD?"FWD":"REV"));
+    Serial.print("Serial Cmd: "); 
+    Serial.print(serial_vx); Serial.print(",");
+    Serial.print(serial_vy); Serial.print(",");
+    Serial.println(serial_wz);
   }
   Serial.println("=============");
 }
 
 // ------------------ 指令處理 ------------------
 void process_cmd_vel(String &msg){
-  // 僅 CHASSIS 模式有效
   if (g_mode != MODE_CHASSIS) { Serial.println("IGNORED: vx,vy,wz (MODE!=CHASSIS)"); return; }
   char buf[128]; msg.toCharArray(buf,sizeof(buf));
   char *p=strtok(buf,","); float vx=0,vy=0,wz=0;
   if(p) vx=atof(p);
   p=strtok(NULL,","); if(p) vy=atof(p);
   p=strtok(NULL,","); if(p) wz=atof(p);
-  float out[4]; mecanum_from_cmd(vx,vy,wz,out); applyWheelCommand(out[0],out[1],out[2],out[3]);
+
+  serial_vx = vx;
+  serial_vy = vy;
+  serial_wz = wz;
 }
 
 void handle_line(String line){
   line.trim();
   if (!line.length()) return;
 
-  // 相容舊 TOKEN：若前綴 <11323310>，剝掉
   const String LEGACY = "<11323310>";
   if (line.startsWith(LEGACY)) { line = line.substring(LEGACY.length()); line.trim(); }
 
-  // 模式切換
   if (line.equalsIgnoreCase("MODE CHASSIS")) { enterChassisMode(); return; }
   if (line.equalsIgnoreCase("MODE SHOOTER")) { enterShooterMode(); return; }
 
-  // 通用
   if (line.equalsIgnoreCase("STATUS")) { print_status(); return; }
   if (line.equalsIgnoreCase("STOP")) {
     if (g_mode==MODE_CHASSIS) stopAllChassis();
@@ -273,24 +284,16 @@ void handle_line(String line){
     return;
   }
 
-  // 依模式解譯
   if (g_mode==MODE_CHASSIS){
-    // 只處理 vx,vy,wz
     if (line.indexOf(',')>=0) { process_cmd_vel(line); return; }
     Serial.println("IGNORED (CHASSIS): not vx,vy,wz");
     return;
   } else {
-    // SHOOTER：F/R/S / S1/S2/S3 / 整數
+    // SHOOTER
     if (equalsIgnoreCase(line,"F")) { startForward(); return; }
     if (equalsIgnoreCase(line,"R")) { startReverse(); return; }
     if (equalsIgnoreCase(line,"S")) { stopStepper();  return; }
 
-    // ★ 新增：S1 / S2 / S3 控制 pin10 的 Servo 角度
-    if (equalsIgnoreCase(line,"S1")) { servoAngle.write(60);  Serial.println("SERVO=60");  return; }
-    if (equalsIgnoreCase(line,"S2")) { servoAngle.write(90);  Serial.println("SERVO=90");  return; }
-    if (equalsIgnoreCase(line,"S3")) { servoAngle.write(120); Serial.println("SERVO=120"); return; }
-
-    // 其餘視為 NEO 速度
     long spd = line.toInt();
     if (spd>100) spd=100; if (spd<-100) spd=-100;
     setSparkSpeed((int)spd);
@@ -302,40 +305,36 @@ void handle_line(String line){
 void setup(){
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== MEGA Multiplex (CHASSIS / SHOOTER) NoToken ===");
+  Serial.println("\n=== MEGA Multiplex (CHASSIS + RC / SHOOTER) ===");
 
-  // 底盤腳位
+  // 底盤 PWM
   pinMode(M1_PWM_A_PIN, OUTPUT); pinMode(M1_PWM_B_PIN, OUTPUT);
   pinMode(M2_PWM_A_PIN, OUTPUT); pinMode(M2_PWM_B_PIN, OUTPUT);
   pinMode(M3_PWM_A_PIN, OUTPUT); pinMode(M3_PWM_B_PIN, OUTPUT);
   pinMode(M4_PWM_A_PIN, OUTPUT); pinMode(M4_PWM_B_PIN, OUTPUT);
-  pinMode(servo, OUTPUT);
 
-  // 步進腳位
+  // RC 輸入
+  pinMode(PIN_RC_CH3, INPUT); // Pin 10 -> vx
+  pinMode(PIN_RC_CH4, INPUT); // Pin 11 -> vy
+  pinMode(PIN_RC_CH5, INPUT); // Pin 12 -> wz
+
+  // 步進
   pinMode(PUL,OUTPUT); pinMode(DIR,OUTPUT); pinMode(ENA,OUTPUT);
-  digitalWrite(PUL,LOW); digitalWrite(ENA,HIGH); // 先抱死
+  digitalWrite(PUL,LOW); digitalWrite(ENA,HIGH);
 
-  // 初始進 CHASSIS，並確保發射子系統關閉
   ensureServo(false);
   enterChassisMode();
 
-  // ★ 新增：pin10 Servo 初始化
-  servoAngle.attach(servo);   // 或直接寫 10
-  servoAngle.write(90);       // 預設 90 度
-
-  Serial.println("usage：MODE CHASSIS / MODE SHOOTER / STATUS / STOP / vx,vy,wz / F/R/S / S1/S2/S3 / -100..100");
+  Serial.println("Ready. Use AT10II: CH3=vx, CH4=vy, CH5=wz");
 }
 
 void loop(){
-  // 只跑當前模式的服務
-  if (g_mode==MODE_CHASSIS){
-    // 無需處理步進；NEO Servo 已 detach
-  } else {
-    // 發射模式：處理步進脈衝
+  // SHOOTER 模式
+  if (g_mode == MODE_SHOOTER) {
     serviceStepper();
   }
 
-  // 收指令（\n 為一行）
+  // Serial 指令
   while (Serial.available()){
     char c=(char)Serial.read(); if (c=='\r') continue;
     if (c=='\n'){ String line=serialBuf; serialBuf=""; handle_line(line); }
@@ -345,10 +344,33 @@ void loop(){
     }
   }
 
-  // 僅在 CHASSIS 模式更新 PWM
-  if (g_mode==MODE_CHASSIS) rampUpdateAndApply();
+  // CHASSIS 模式：Serial + RC 混控
+  if (g_mode == MODE_CHASSIS) {
+    // 1. 讀取 RC (CH3=vx, CH4=vy, CH5=wz)
+    float rc_vx = readRCChannel(PIN_RC_CH3); // 前後
+    float rc_vy = readRCChannel(PIN_RC_CH4); // 左右
+    float rc_wz = readRCChannel(PIN_RC_CH5); // 旋轉
 
-  // Telemetry（各模式各自頻率）
+    // 2. 混合
+    float total_vx = serial_vx + rc_vx;
+    float total_vy = serial_vy + rc_vy;
+    float total_wz = serial_wz + rc_wz;
+
+    // 3. 限制 -1 ~ 1
+    if(total_vx > 1.0) total_vx = 1.0; if(total_vx < -1.0) total_vx = -1.0;
+    if(total_vy > 1.0) total_vy = 1.0; if(total_vy < -1.0) total_vy = -1.0;
+    if(total_wz > 1.0) total_wz = 1.0; if(total_wz < -1.0) total_wz = -1.0;
+
+    // 4. 計算與應用
+    float out[4]; 
+    mecanum_from_cmd(total_vx, total_vy, total_wz, out); 
+    applyWheelCommand(out[0], out[1], out[2], out[3]);
+
+    // 5. Ramp 更新
+    rampUpdateAndApply();
+  }
+
+  // Telemetry
   unsigned long now = millis();
   if (g_mode==MODE_CHASSIS){
     if (now - lastTelemetryMs >= TELE_CHASSIS_MS){ lastTelemetryMs = now; tele_chassis(); }
