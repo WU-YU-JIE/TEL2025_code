@@ -38,7 +38,7 @@
 
   // === 腳位定義 ===
   const int M1_PUL = 13, M1_DIR = 12, M1_ENA = 11;
-  const int M2_PUL = 10, M2_DIR = 9,  M2_ENA = 8;
+  const int M2_PUL = 7, M2_DIR = 6,  M2_ENA = 5;
 
   // === 參數設定 ===
   const long M1_STEPS_PER_REV = 42667L; 

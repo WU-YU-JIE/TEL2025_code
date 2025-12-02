@@ -37,10 +37,7 @@ const int RC_CENTER = 1488;
 const int RC_DEADZONE = 200;
 const int RC_HIGH_THRES = RC_CENTER + RC_DEADZONE; // 1688
 const int RC_LOW_THRES  = RC_CENTER - RC_DEADZONE; // 1288
-
-// 手動模式速度設定
-const int M1_MANUAL_SPEED_US = 1500; // M1 手動模式速度
-const int M2_MANUAL_SPEED_US = 50;   // M2 手動模式速度 (改成 50)
+const int MANUAL_SPEED_US = 1500; // 手動模式速度
 
 // === 中斷讀取變數 (Volatile) ===
 volatile uint16_t rc_shared[6] = {0}; // 儲存最新的脈衝寬度
@@ -82,7 +79,7 @@ struct StepperAxis {
 };
 
 const int M1_PUL = 13, M1_DIR = 12, M1_ENA = 11;
-const int M2_PUL = 10, M2_DIR = 9,  M2_ENA = 8;
+const int M2_PUL = 7, M2_DIR = 6,  M2_ENA = 5;
 const long M1_STEPS_PER_REV = 42667L; 
 const long M2_STEPS_PER_REV = 57600L; 
 const float GEAR_RATIO = 9.0;         
@@ -206,7 +203,7 @@ void loop() {
       if (m1.DIR_INVERT) dirPinState = !dirPinState;
       digitalWrite(m1.DIR, dirPinState ? HIGH : LOW);
       
-      stepOnePulse(m1, M1_MANUAL_SPEED_US);
+      stepOnePulse(m1, MANUAL_SPEED_US);
       double anglePerStep = 360.0 / (double)m1.stepsPerRev;
       m1.currentAngle += (m1_manual_dir * anglePerStep);
     }
@@ -217,7 +214,7 @@ void loop() {
       if (m2.DIR_INVERT) dirPinState = !dirPinState;
       digitalWrite(m2.DIR, dirPinState ? HIGH : LOW);
       
-      stepOnePulse(m2, M2_MANUAL_SPEED_US);
+      stepOnePulse(m2, MANUAL_SPEED_US);
       m2_target_angle = m2.currentAngle; // 同步目標
     }
 
@@ -260,8 +257,7 @@ void loop() {
         }
         else if (cmd.startsWith("increase") || cmd.startsWith("decrease")) {
            int comma = cmd.indexOf(',');
-           // M2 連續預設速度同步為 50
-           int spd = 50; if (comma > 0) spd = cmd.substring(comma+1).toInt();
+           int spd = 1500; if (comma > 0) spd = cmd.substring(comma+1).toInt();
            int dir = cmd.startsWith("increase") ? 1 : -1;
            runContinuousM2(dir, spd); // 進入阻塞執行，直到 stop
         }
