@@ -13,7 +13,7 @@
 //   -100..100             僅 SHOOTER 模式有效（NEO 速度）
 //
 // 新增：
-//   S1 / S2 / S3          僅 SHOOTER 模式有效（pin10 Servo 轉到 60 / 90 / 120 度）
+//   S1 / S2 / S3          僅 SHOOTER 模式有效（pin10 Servo 轉到 60 / 90 / 125 度）
 //
 // 降負荷重點：
 //  - 僅在 CHASSIS 模式執行 rampUpdateAndApply() 與底盤 telemetry
@@ -57,7 +57,7 @@ bool  motorActive       = false;
 
 // ================== SHOOTER（NEO + 步進） ==================
 Servo sparkMax;
-const int SPARK_PWM_PIN = 13;     // NEO (Spark MAX) PWM
+const int SPARK_PWM_PIN = 11;     // NEO (Spark MAX) PWM
 bool servoAttached = false;
 int  neoSpeed = 0;                // -100..100（僅作狀態記錄）
 
@@ -288,7 +288,7 @@ void handle_line(String line){
     // ★ 新增：S1 / S2 / S3 控制 pin10 的 Servo 角度
     if (equalsIgnoreCase(line,"S1")) { servoAngle.write(60);  Serial.println("SERVO=60");  return; }
     if (equalsIgnoreCase(line,"S2")) { servoAngle.write(90);  Serial.println("SERVO=90");  return; }
-    if (equalsIgnoreCase(line,"S3")) { servoAngle.write(120); Serial.println("SERVO=120"); return; }
+    if (equalsIgnoreCase(line,"S3")) { servoAngle.write(125); Serial.println("SERVO=125"); return; }
 
     // 其餘視為 NEO 速度
     long spd = line.toInt();
