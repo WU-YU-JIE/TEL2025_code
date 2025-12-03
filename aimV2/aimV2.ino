@@ -28,9 +28,9 @@
 const int PIN_RC_CH8  = A8;   // PK0 -> Index 0
 const int PIN_RC_CH9  = A9;   // PK1 -> Index 1
 const int PIN_RC_CH10 = A10;  // PK2 -> Index 2
-const int PIN_RC_CH1  = A11;  // PK3 -> Index 3
-const int PIN_RC_CH2  = A12;  // PK4 -> Index 4
-const int PIN_RC_CH7  = A13;  // PK5 -> Index 5
+const int PIN_RC_CH1  = A12;  // PK3 -> Index 3
+const int PIN_RC_CH2  = A13;  // PK4 -> Index 4
+const int PIN_RC_CH7  = A11;  // PK5 -> Index 5 CH7跟CH11交換了
 
 // RC 參數
 const int RC_CENTER = 1488;
@@ -297,6 +297,7 @@ void readHoleSensors() {
   valA9  = getRCValue(1); 
   valA10 = getRCValue(2); 
 
+
   if (valA8 != 0 || valA9 != 0 || valA10 != 0) {
       String rowChar = "";
       String colChar = "";
@@ -330,8 +331,9 @@ void readHoleSensors() {
 
 void readManualSensors() {
   // A11=Index 3, A12=Index 4
-  valA11 = getRCValue(3);
-  valA12 = getRCValue(4);
+  valA11 = getRCValue(4);
+  valA12 = getRCValue(5);
+
 
   // M1
   if (valA11 > RC_HIGH_THRES) { m1_manual_active = true; m1_manual_dir = -1; }
@@ -346,7 +348,7 @@ void readManualSensors() {
 
 void readDetectSensor() {
   // A13=Index 5
-  valA13 = getRCValue(5);
+  valA13 = getRCValue(3);
 
   if (valA13 > 1700) {
     if (lastDetectState != "on") {

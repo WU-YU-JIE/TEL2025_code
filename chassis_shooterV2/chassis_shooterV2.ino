@@ -4,14 +4,14 @@
 // 
 // 功能：
 //   1. 麥輪底盤：全時接收遙控器 A8/A9/A10 (CH3/4/5) 控制 vx,vy,wz
-//   2. 發射機構：全時接收遙控器 A12 (CH6) 控制 F/S/R 流程，A11 (CH11) 控制 Servo
+//   2. 發射機構：全時接收遙控器 A12 (CH6) 控制 F/S/R 流程，A12 (CH11) 控制 Servo
 //
 // 遙控器映射 (R12DS)：
 //   A8 (CH3)  -> vx (1920->1, 1056->-1, deadband 0.1)
 //   A9 (CH4)  -> vy (1920->1, 1056->-1, deadband 0.1)
 //   A10 (CH5) -> wz (1920->1, 1056->-1, deadband 0.3)
-//   A11 (CH11)-> Servo S2/S3 (1900->S3, 1056->S2)
-//   A12 (CH6) -> Function F/S/R (1920->R, 1488->S, 1056->F)
+//   A12 (CH11)-> Servo S2/S3 (1900->S3, 1056->S2) CH7跟CH11交換了
+//   A11 (CH6) -> Function F/S/R (1920->R, 1488->S, 1056->F)
 
 #include <Arduino.h>
 #include <math.h>
@@ -22,8 +22,8 @@
 const int PIN_RC_VX   = A8;   // PK0 (PCINT16)
 const int PIN_RC_VY   = A9;   // PK1 (PCINT17)
 const int PIN_RC_WZ   = A10;  // PK2 (PCINT18)
-const int PIN_RC_SERVO= A11;  // PK3 (PCINT19)
-const int PIN_RC_FUNC = A12;  // PK4 (PCINT20)
+const int PIN_RC_SERVO= A12;  // PK3 (PCINT19)
+const int PIN_RC_FUNC = A11;  // PK4 (PCINT20)
 
 // 中斷用全域變數
 volatile uint16_t rc_raw_values[5] = {0}; // 0:VX, 1:VY, 2:WZ, 3:Servo, 4:Func
@@ -312,7 +312,7 @@ void process_control_logic() {
 
   // --- 射擊控制 ---
   // A. Servo (Map index: 3)
-  uint16_t sVal = getRawRC(3);
+  uint16_t sVal = getRawRC(4);
   if (sVal > 1500) { 
       if(servoAngle.read() != 125) { servoAngle.write(125); Serial.println("SERVO=125 (S3)"); }
   } else if (sVal > 900) { 
@@ -320,7 +320,7 @@ void process_control_logic() {
   }
 
   // B. Function F/S/R (Map index: 4) - 1920->R, 1056->F
-  uint16_t fVal = getRawRC(4);
+  uint16_t fVal = getRawRC(3);
   int cmd = 0; 
   if (fVal > 1700) cmd = -1;      // > 1700 -> R
   else if (fVal < 1200 && fVal > 500) cmd = 1; // < 1200 -> F
