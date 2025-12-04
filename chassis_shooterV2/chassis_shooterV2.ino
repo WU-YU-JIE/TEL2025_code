@@ -1,17 +1,14 @@
-// chassis_shooter.ino
+// chassis_shooter_v2.ino
 // 單一韌體，全時運作模式 (無 Mode 區分)
-// 改良版：使用 Pin Change Interrupt 讀取 RC，解決步進馬達卡頓問題
+// 改良版：使用 Pin Change Interrupt 讀取 RC
+// 更新功能：增加 +/- 0.5 的邏輯判斷與 Serial 輸出
 // 
-// 功能：
-//   1. 麥輪底盤：全時接收遙控器 A8/A9/A10 (CH3/4/5) 控制 vx,vy,wz
-//   2. 發射機構：全時接收遙控器 A12 (CH6) 控制 F/S/R 流程，A12 (CH11) 控制 Servo
-//
-// 遙控器映射 (R12DS)：
-//   A8 (CH3)  -> vx (1920->1, 1056->-1, deadband 0.1)
-//   A9 (CH4)  -> vy (1920->1, 1056->-1, deadband 0.1)
-//   A10 (CH5) -> wz (1920->1, 1056->-1, deadband 0.3)
-//   A12 (CH11)-> Servo S2/S3 (1900->S3, 1056->S2) CH7跟CH11交換了
-//   A11 (CH6) -> Function F/S/R (1920->R, 1488->S, 1056->F)
+// 遙控器映射 (R12DS) - A11 (Function):
+//   > 1800      -> -1 (Reverse/Clear)
+//   1650 ~ 1800 -> -0.5 (Print "1,-14.5")  <--- NEW
+//   1350 ~ 1650 ->  0 (Stop)
+//   1200 ~ 1350 -> +0.5 (Print "automode") <--- NEW
+//   < 1200      ->  1 (Forward/Fire)
 
 #include <Arduino.h>
 #include <math.h>
@@ -95,6 +92,10 @@ const unsigned long TELE_INTERVAL_MS = 250UL;
 const unsigned long LOGIC_INTERVAL_MS = 20UL; // 邏輯更新頻率 (50Hz)
 unsigned long lastLogicMs = 0;
 
+// 控制 print 頻率變數
+unsigned long lastSpecialPrintMs = 0;
+const unsigned long SPECIAL_PRINT_INTERVAL = 100; // 特殊字串輸出間隔 (ms)
+
 bool equalsIgnoreCase(const String& a, const char* b) {
   String t=a; t.toUpperCase(); String u=String(b); u.toUpperCase(); return t==u;
 }
@@ -115,7 +116,6 @@ ISR(PCINT2_vect) {
            rc_rise_times[i] = now;
         } else {
            // 下降緣 (Fall)，計算脈寬
-           // 簡單過濾異常短或長的脈衝 (例如 <500 或 >2500) 可在此處做，或後續處理
            rc_raw_values[i] = (uint16_t)(now - rc_rise_times[i]);
         }
      }
@@ -222,10 +222,40 @@ void serviceStepper(){
 
 // 更新 Shooter 狀態機
 void updateShooterLogic(int cmdVal) {
-  // cmdVal: 0=Stop, 1=Forward, -1=Reverse
+  // cmdVal: 0=Stop, 1=Forward, -1=Reverse, 2=AutoMode(+0.5), -2=Data(-0.5)
   unsigned long now = millis();
 
   switch (cmdVal) {
+    // === 指令 +0.5 (Print "automode") ===
+    case 2:
+      // 進入此模式先強制停止射擊機構
+      if (currentShooterState != ST_IDLE) {
+          setSparkSpeed(0);
+          stopStepper();
+          currentShooterState = ST_IDLE;
+      }
+      // 限制輸出頻率以免塞爆 Serial
+      if (now - lastSpecialPrintMs > SPECIAL_PRINT_INTERVAL) {
+        Serial.println("automode");
+        lastSpecialPrintMs = now;
+      }
+      break;
+
+    // === 指令 -0.5 (Print "1,-14.5") ===
+    case -2:
+      // 進入此模式先強制停止射擊機構
+      if (currentShooterState != ST_IDLE) {
+          setSparkSpeed(0);
+          stopStepper();
+          currentShooterState = ST_IDLE;
+      }
+      // 限制輸出頻率
+      if (now - lastSpecialPrintMs > SPECIAL_PRINT_INTERVAL) {
+        Serial.println("1,-14.5");
+        lastSpecialPrintMs = now;
+      }
+      break;
+
     // === 指令 F (Forward/Fire) ===
     case 1: 
       if (currentShooterState != ST_FIRE_PREP && currentShooterState != ST_FIRING) {
@@ -311,20 +341,43 @@ void process_control_logic() {
   applyWheelCommand(out[0], out[1], out[2], out[3]);
 
   // --- 射擊控制 ---
-  // A. Servo (Map index: 3)
-  uint16_t sVal = getRawRC(4);
+  // A. Servo (Map index: 4 - 這裡原本Code是4, 根據你的描述 CH11 Servo)
+  uint16_t sVal = getRawRC(4); 
   if (sVal > 1500) { 
       if(servoAngle.read() != 125) { servoAngle.write(125); Serial.println("SERVO=125 (S3)"); }
   } else if (sVal > 900) { 
       if(servoAngle.read() != 90) { servoAngle.write(90); Serial.println("SERVO=90 (S2)"); }
   }
 
-  // B. Function F/S/R (Map index: 4) - 1920->R, 1056->F
+  // B. Function F/S/R (Map index: 3 - A11/CH6)
+  // 映射邏輯擴展：
+  // > 1800      -> -1 (Reverse)
+  // 1650 ~ 1800 -> -2 (User's -0.5 -> "1,-14.5")
+  // 1350 ~ 1650 ->  0 (Stop)
+  // 1200 ~ 1350 ->  2 (User's +0.5 -> "automode")
+  // < 1200      ->  1 (Forward)
+  
   uint16_t fVal = getRawRC(3);
   int cmd = 0; 
-  if (fVal > 1700) cmd = -1;      // > 1700 -> R
-  else if (fVal < 1200 && fVal > 500) cmd = 1; // < 1200 -> F
-  else cmd = 0;                   // -> S
+  
+  if (fVal > 1800) {
+      cmd = -1;  // Reverse
+  } 
+  else if (fVal > 1650) {
+      cmd = -2;  // -0.5 (Print Data)
+  }
+  else if (fVal > 1350) {
+      cmd = 0;   // Stop (Mid ~1500)
+  }
+  else if (fVal > 1200) {
+      cmd = 2;   // +0.5 (Automode)
+  }
+  else if (fVal > 500) { // 最低閥值過濾
+      cmd = 1;   // Forward
+  }
+  else {
+      cmd = 0;   // 訊號遺失或極低，預設 Stop
+  }
   
   // 更新狀態機
   updateShooterLogic(cmd);
@@ -332,6 +385,11 @@ void process_control_logic() {
 
 // ------------------ Telemetry ------------------
 void print_telemetry(){
+  // 在特殊模式下減少 Telemetry 干擾
+  uint16_t fVal = getRawRC(3);
+  if (fVal > 1200 && fVal < 1350) return; // automode 區間不印 Tele
+  if (fVal > 1650 && fVal < 1800) return; // -0.5 區間不印 Tele
+
   Serial.print("TELE: PWM[");
   Serial.print(currentPWMvals[0],0); Serial.print(",");
   Serial.print(currentPWMvals[1],0); Serial.print(",");
@@ -342,9 +400,6 @@ void print_telemetry(){
   Serial.print(" STEP=");
   Serial.print(stepState==STEP_STOP?"S":(stepState==STEP_FWD?"F":"R"));
   Serial.print(" ST="); Serial.println(currentShooterState);
-  
-  // 測試用：印出 RC 原始值，檢查中斷是否正常
-  // Serial.print(" RC: "); Serial.print(getRawRC(0)); Serial.print(" "); Serial.println(getRawRC(4));
 }
 
 // ------------------ 指令處理 (僅保留手動除錯) ------------------
@@ -359,6 +414,9 @@ void handle_line(String line){
   if (equalsIgnoreCase(line,"F")) { updateShooterLogic(1); return; }
   if (equalsIgnoreCase(line,"S")) { updateShooterLogic(0); return; }
   if (equalsIgnoreCase(line,"R")) { updateShooterLogic(-1); return; }
+  // 手動觸發特殊模式
+  if (equalsIgnoreCase(line,"AUTO")) { updateShooterLogic(2); return; } 
+  if (equalsIgnoreCase(line,"DATA")) { updateShooterLogic(-2); return; }
 
   long spd = line.toInt();
   if (spd>100) spd=100; if (spd<-100) spd=-100;
@@ -371,7 +429,7 @@ void handle_line(String line){
 void setup(){
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== MEGA Integrated Chassis & Shooter (ISR RC) ===");
+  Serial.println("\n=== MEGA Integrated Chassis & Shooter (ISR RC) v2 ===");
 
   // 設定 RC 輸入 (宣告為輸入，雖然中斷不需要 pullup，但習慣上設定)
   pinMode(PIN_RC_VX, INPUT);
