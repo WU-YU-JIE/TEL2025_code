@@ -1,13 +1,14 @@
-// chassis_shooter_v2.ino
+// chassis_shooter_v2_autotime.ino
 // 單一韌體，全時運作模式 (無 Mode 區分)
 // 改良版：使用 Pin Change Interrupt 讀取 RC
 // 更新功能：增加 +/- 0.5 的邏輯判斷與 Serial 輸出
+// 新增功能：Serial 指令 "autotime" 強制射擊 3 秒
 // 
 // 遙控器映射 (R12DS) - A11 (Function):
 //   > 1800      -> -1 (Reverse/Clear)
-//   1650 ~ 1800 -> -0.5 (Print "1,-14.5")  <--- NEW
+//   1650 ~ 1800 -> -0.5 (Print "1,-14.5")
 //   1350 ~ 1650 ->  0 (Stop)
-//   1200 ~ 1350 -> +0.5 (Print "automode") <--- NEW
+//   1200 ~ 1350 -> +0.5 (Print "automode")
 //   < 1200      ->  1 (Forward/Fire)
 
 #include <Arduino.h>
@@ -95,6 +96,9 @@ unsigned long lastLogicMs = 0;
 // 控制 print 頻率變數
 unsigned long lastSpecialPrintMs = 0;
 const unsigned long SPECIAL_PRINT_INTERVAL = 100; // 特殊字串輸出間隔 (ms)
+
+// [新增] 自動射擊倒數計時器
+unsigned long autoFireEndTime = 0; 
 
 bool equalsIgnoreCase(const String& a, const char* b) {
   String t=a; t.toUpperCase(); String u=String(b); u.toUpperCase(); return t==u;
@@ -236,7 +240,7 @@ void updateShooterLogic(int cmdVal) {
       }
       // 限制輸出頻率以免塞爆 Serial
       if (now - lastSpecialPrintMs > SPECIAL_PRINT_INTERVAL) {
-        Serial.println("automode");
+        Serial.println("1,-14.5");
         lastSpecialPrintMs = now;
       }
       break;
@@ -341,7 +345,7 @@ void process_control_logic() {
   applyWheelCommand(out[0], out[1], out[2], out[3]);
 
   // --- 射擊控制 ---
-  // A. Servo (Map index: 4 - 這裡原本Code是4, 根據你的描述 CH11 Servo)
+  // A. Servo (Map index: 4 - CH11 Servo)
   uint16_t sVal = getRawRC(4); 
   if (sVal > 1500) { 
       if(servoAngle.read() != 125) { servoAngle.write(125); Serial.println("SERVO=125 (S3)"); }
@@ -350,33 +354,34 @@ void process_control_logic() {
   }
 
   // B. Function F/S/R (Map index: 3 - A11/CH6)
-  // 映射邏輯擴展：
-  // > 1800      -> -1 (Reverse)
-  // 1650 ~ 1800 -> -2 (User's -0.5 -> "1,-14.5")
-  // 1350 ~ 1650 ->  0 (Stop)
-  // 1200 ~ 1350 ->  2 (User's +0.5 -> "automode")
-  // < 1200      ->  1 (Forward)
-  
-  uint16_t fVal = getRawRC(3);
   int cmd = 0; 
   
-  if (fVal > 1800) {
-      cmd = -1;  // Reverse
-  } 
-  else if (fVal > 1650) {
-      cmd = -2;  // -0.5 (Print Data)
-  }
-  else if (fVal > 1350) {
-      cmd = 0;   // Stop (Mid ~1500)
-  }
-  else if (fVal > 1200) {
-      cmd = 2;   // +0.5 (Automode)
-  }
-  else if (fVal > 500) { // 最低閥值過濾
-      cmd = 1;   // Forward
+  // [修改] 邏輯判斷優先級：檢查是否在自動射擊倒數時間內
+  if (millis() < autoFireEndTime) {
+      cmd = 1; // 強制設定為 Forward (Fire)
   }
   else {
-      cmd = 0;   // 訊號遺失或極低，預設 Stop
+      // 2. 如果不在自動時間內，才讀取遙控器訊號
+      uint16_t fVal = getRawRC(3);
+      
+      if (fVal > 1800) {
+          cmd = -1;  // Reverse
+      } 
+      else if (fVal > 1650) {
+          cmd = -2;  // -0.5 (Print Data)
+      }
+      else if (fVal > 1350) {
+          cmd = 0;   // Stop (Mid ~1500)
+      }
+      else if (fVal > 1200) {
+          cmd = 2;   // +0.5 (Automode)
+      }
+      else if (fVal > 500) { // 最低閥值過濾
+          cmd = 1;   // Forward
+      }
+      else {
+          cmd = 0;   // 訊號遺失或極低，預設 Stop
+      }
   }
   
   // 更新狀態機
@@ -387,8 +392,12 @@ void process_control_logic() {
 void print_telemetry(){
   // 在特殊模式下減少 Telemetry 干擾
   uint16_t fVal = getRawRC(3);
-  if (fVal > 1200 && fVal < 1350) return; // automode 區間不印 Tele
-  if (fVal > 1650 && fVal < 1800) return; // -0.5 區間不印 Tele
+  // [修改] 如果正在自動射擊倒數，也不隱藏 Telemetry，或者可以選擇隱藏
+  // 這裡維持原樣，只隱藏 automode 和 data 模式
+  if (millis() > autoFireEndTime) {
+    if (fVal > 1200 && fVal < 1350) return; // automode 區間不印 Tele
+    if (fVal > 1650 && fVal < 1800) return; // -0.5 區間不印 Tele
+  }
 
   Serial.print("TELE: PWM[");
   Serial.print(currentPWMvals[0],0); Serial.print(",");
@@ -402,13 +411,22 @@ void print_telemetry(){
   Serial.print(" ST="); Serial.println(currentShooterState);
 }
 
-// ------------------ 指令處理 (僅保留手動除錯) ------------------
+// ------------------ 指令處理 ------------------
 void handle_line(String line){
   line.trim();
   if (!line.length()) return;
 
   const String LEGACY = "<11323310>";
   if (line.startsWith(LEGACY)) { line = line.substring(LEGACY.length()); line.trim(); }
+
+  // [新增] autotime 指令
+  // 設定時間為 當前時間 + 3500ms
+  // (包含 0.5s 預熱 + 3.0s 全速 ST_FIRING)
+  if (equalsIgnoreCase(line, "autotime")) { 
+    autoFireEndTime = millis() + 3500; 
+    Serial.println("CMD: AUTO FIRING (3s duration)");
+    return; 
+  }
 
   // 僅保留射擊測試指令
   if (equalsIgnoreCase(line,"F")) { updateShooterLogic(1); return; }
@@ -429,7 +447,7 @@ void handle_line(String line){
 void setup(){
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== MEGA Integrated Chassis & Shooter (ISR RC) v2 ===");
+  Serial.println("\n=== MEGA Integrated Chassis & Shooter (ISR RC) v2.1 AutoTime ===");
 
   // 設定 RC 輸入 (宣告為輸入，雖然中斷不需要 pullup，但習慣上設定)
   pinMode(PIN_RC_VX, INPUT);
@@ -480,7 +498,7 @@ void loop(){
     rampUpdateAndApply();
   }
 
-  // 3. 收 Serial 指令 (除錯用)
+  // 3. 收 Serial 指令
   while (Serial.available()){
     char c=(char)Serial.read(); if (c=='\r') continue;
     if (c=='\n'){ String line=serialBuf; serialBuf=""; handle_line(line); }

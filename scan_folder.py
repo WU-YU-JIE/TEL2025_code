@@ -19,7 +19,7 @@ TEXT_EXTS = {
 }
 
 # 內容輸出控制
-MAX_TEXT_BYTES = 512 * 1024      # 單一文字檔最多讀 512 KB 內容
+MAX_TEXT_BYTES = 512 * 1024      # 單一文字檔最多讀 512 KB 內容喔
 MAX_BINARY_BYTES = 0             # 二進位檔是否輸出 base64（0=不輸出，只記錄雜湊與中繼資料）
 ENCODING = "utf-8"               # 文字讀取編碼（失敗則用 errors='replace'）
 

@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 
 # 1. 設定模型路徑 (使用 raw string r"..." 避免路徑錯誤)
-model_path = r"C:\Users\user\OneDrive - 中原大學\桌面\大學作品集\東京威力\TEL.v2i\runs\detect\train16\weights\best.pt"
+model_path = r"C:\Users\user\OneDrive - 中原大學\桌面\大學作品集\東京威力\TEL.v2i\runs\detect\train16\weights\v3_640_274_n.pt"
 
 print(f"正在載入模型：{model_path}")
 
